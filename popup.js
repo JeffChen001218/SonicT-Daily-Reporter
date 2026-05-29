@@ -1,9 +1,9 @@
 const DEFAULT_REPORTS = [];
-const LEGACY_DEFAULT_REPORT_URL = "https://ntba.gte666.com/#/dashboard/11500_132528";
+const LEGACY_DEFAULT_REPORT_ID = "sample-ntba";
 
 const DEFAULT_CREDENTIALS = {
-  account: "chenjianfeng",
-  password: "tba@Jeff666"
+  account: "",
+  password: ""
 };
 
 const DEFAULT_PARSE_SECTIONS = [
@@ -334,7 +334,7 @@ function isLegacyDefaultReports(value) {
   return (
     Array.isArray(value) &&
     value.length === 1 &&
-    normalizeUrlForCompare(value[0]?.url) === normalizeUrlForCompare(LEGACY_DEFAULT_REPORT_URL)
+    value[0]?.id === LEGACY_DEFAULT_REPORT_ID
   );
 }
 

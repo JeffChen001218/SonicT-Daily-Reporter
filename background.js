@@ -1,9 +1,9 @@
 const DEFAULT_REPORTS = [];
-const LEGACY_DEFAULT_REPORT_URL = "https://ntba.gte666.com/#/dashboard/11500_132528";
+const LEGACY_DEFAULT_REPORT_ID = "sample-ntba";
 
 const DEFAULT_CREDENTIALS = {
-  account: "chenjianfeng",
-  password: "tba@Jeff666"
+  account: "",
+  password: ""
 };
 
 const DEFAULT_PARSE_SECTIONS = [
@@ -87,7 +87,6 @@ async function handleMessage(message, sender) {
     case "GET_STATE":
       return getState();
     case "CONTENT_LOG":
-      await appendLog(formatContentLog(sender.tab, message.payload));
       return {
         ok: true
       };
@@ -138,10 +137,7 @@ async function startRun(payload) {
     runtimeState: publicRuntimeState()
   });
 
-  await appendLog(`任务开始，共 ${reports.length} 个网址`);
-
   void runQueue(reports, credentials, parseSections, outputTemplate, rowOffsets).catch(async (error) => {
-    await appendLog(`任务异常中断：${messageFromError(error)}`);
     activeRun.running = false;
     activeRun.currentTabId = null;
     await persistRuntimeState();
@@ -159,7 +155,6 @@ async function stopRun() {
       type: "STOP_SNIFF"
     }).catch(() => null);
   }
-  await appendLog("已收到停止指令，当前页面会尽快结束");
   await persistRuntimeState();
   return {
     ok: true
@@ -176,10 +171,6 @@ async function getState() {
 }
 
 async function runQueue(reports, credentials, parseSections, outputTemplate, rowOffsets) {
-  if (!reports.length) {
-    await appendLog("没有可执行的网址");
-  }
-
   for (let index = 0; index < reports.length; index += 1) {
     const report = reports[index];
     let openedTabId = null;
@@ -190,7 +181,6 @@ async function runQueue(reports, credentials, parseSections, outputTemplate, row
     }
 
     await setReportStatus(report.id, "打开中", report.url);
-    await appendLog(`[${index + 1}/${reports.length}] 打开：${report.url}`);
 
     try {
       const tab = await tabsCreate({
@@ -228,7 +218,7 @@ async function runQueue(reports, credentials, parseSections, outputTemplate, row
       await appendOutputBlock(formatFailure(errorText, null, index, outputTemplate));
     } finally {
       if (openedTabId) {
-        await tabsRemove(openedTabId).catch((error) => appendLog(`关闭页面失败：${messageFromError(error)}`));
+        await tabsRemove(openedTabId).catch(() => null);
       }
       activeRun.currentTabId = null;
     }
@@ -236,7 +226,6 @@ async function runQueue(reports, credentials, parseSections, outputTemplate, row
 
   activeRun.running = false;
   activeRun.currentTabId = null;
-  await appendLog(activeRun.shouldStop ? "任务已停止" : "任务完成");
   await persistRuntimeState();
 }
 
@@ -261,7 +250,6 @@ async function runSniffOnTab(tabId, payload) {
 
       if (response?.needsRetry) {
         lastError = new Error(response.error || "页面发生跳转，准备重试");
-        await appendLog(`页面脚本请求重试：${lastError.message}`);
         await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
         await sleep(1200);
         continue;
@@ -270,7 +258,6 @@ async function runSniffOnTab(tabId, payload) {
       return response;
     } catch (error) {
       lastError = error;
-      await appendLog(`第 ${attempt} 次解析尝试失败：${messageFromError(error)}`);
       await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS).catch(() => null);
       await sleep(1500);
     }
@@ -328,24 +315,8 @@ function isLegacyDefaultReports(value) {
   return (
     Array.isArray(value) &&
     value.length === 1 &&
-    normalizeUrlForCompare(value[0]?.url) === normalizeUrlForCompare(LEGACY_DEFAULT_REPORT_URL)
+    value[0]?.id === LEGACY_DEFAULT_REPORT_ID
   );
-}
-
-function normalizeUrlForCompare(value) {
-  const trimmed = String(value || "").trim();
-  if (!trimmed) {
-    return "";
-  }
-
-  try {
-    const url = new URL(trimmed);
-    url.protocol = url.protocol.toLowerCase();
-    url.hostname = url.hostname.toLowerCase();
-    return url.href;
-  } catch (error) {
-    return trimmed;
-  }
 }
 
 function normalizeCredentials(value) {
@@ -410,19 +381,6 @@ function publicRuntimeState() {
   };
 }
 
-async function appendLog(line) {
-  if (typeof activeRun.log !== "string") {
-    const stored = await storageGet("runLog");
-    activeRun.log = stored.runLog || "";
-  }
-
-  activeRun.log += `[${formatClock(new Date())}] ${line}\n`;
-  await storageSet({
-    runLog: activeRun.log
-  });
-  broadcastUpdate(publicRuntimeState(), activeRun.log);
-}
-
 async function appendOutputBlock(block) {
   if (typeof activeRun.log !== "string") {
     const stored = await storageGet("runLog");
@@ -444,40 +402,12 @@ async function appendOutputBlock(block) {
   broadcastUpdate(publicRuntimeState(), activeRun.log);
 }
 
-function formatContentLog(tab, payload) {
-  const label = tab?.url ? shortUrl(tab.url) : "页面";
-  return `${label}：${payload?.text || ""}`;
-}
-
 function formatReportResult(result, index, outputTemplate) {
-  const lines = [renderOutputTemplate(outputTemplate, result)];
-
-  if (hasParseProblem(result)) {
-    lines.push("调试状态：");
-    lines.push(...formatSectionProblemLines(result));
-    lines.push(...formatDebugLines(result?.debug || []));
-  }
-
-  return lines.join("\n");
+  return renderOutputTemplate(outputTemplate, result);
 }
 
 function formatFailure(errorText, result, index, outputTemplate) {
-  const lines = [];
-
-  if (result) {
-    lines.push(renderOutputTemplate(outputTemplate, result));
-  } else {
-    lines.push("- ");
-  }
-
-  lines.push("调试状态：");
-  lines.push(`- 解析失败：${errorText}`);
-  lines.push(...formatSectionProblemLines(result));
-  if (result?.debug?.length) {
-    lines.push(...formatDebugLines(result.debug));
-  }
-
-  return lines.join("\n");
+  return renderOutputTemplate(outputTemplate, result || createEmptyResult());
 }
 
 function renderOutputTemplate(template, result) {
@@ -526,45 +456,11 @@ function hasParseProblem(result) {
   return !result.projectCode || result.sections.some((section) => !section?.ok);
 }
 
-function formatSectionProblemLines(result) {
-  if (!Array.isArray(result?.sections)) {
-    return [];
-  }
-
-  return result.sections
-    .filter((section) => !section.ok)
-    .map((section) => {
-      const title = section.title || section.key || "未知板块";
-      return `- ${title}：${section.error || "未完整解析"}`;
-    })
-    .concat(result.projectCode ? [] : ["- 项目code：未匹配到 sonic_T????-.*"]);
-}
-
-function formatDebugLines(debug) {
-  const limited = debug.slice(-80);
-  return limited.map((entry) => {
-    if (typeof entry === "string") {
-      return `- ${compactText(entry, 500)}`;
-    }
-    return `- ${compactText(entry.text || JSON.stringify(entry), 500)}`;
-  });
-}
-
-function compactText(text, maxLength) {
-  const compact = String(text || "").replace(/\s+/g, " ").trim();
-  if (compact.length <= maxLength) {
-    return compact;
-  }
-  return `${compact.slice(0, maxLength - 1)}…`;
-}
-
-function shortUrl(url) {
-  try {
-    const parsed = new URL(url);
-    return `${parsed.host}${parsed.pathname}${parsed.hash || ""}`;
-  } catch (error) {
-    return url;
-  }
+function createEmptyResult() {
+  return {
+    projectCode: "",
+    sections: []
+  };
 }
 
 function broadcastUpdate(runtimeState, runLog) {
@@ -658,14 +554,6 @@ function callbackPromise(invoker) {
       resolve(result);
     });
   });
-}
-
-function formatClock(date) {
-  return [
-    String(date.getHours()).padStart(2, "0"),
-    String(date.getMinutes()).padStart(2, "0"),
-    String(date.getSeconds()).padStart(2, "0")
-  ].join(":");
 }
 
 function createId() {
