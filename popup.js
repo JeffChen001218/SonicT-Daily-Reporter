@@ -17,9 +17,12 @@ const DEFAULT_PARSE_SECTIONS = [
   }
 ];
 
-const DEFAULT_OUTPUT_TEMPLATE = `- [code]
+const LEGACY_DEFAULT_OUTPUT_TEMPLATE = `- [code]
 \t- [t1]解析结果是:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
 \t- [t2]解析结果是:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，[t2,h3] [t2,r-1,c3]，[t2,h4] [t2,r-1,c4]`;
+const DEFAULT_OUTPUT_TEMPLATE = `[code]
+消耗量级:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
+指标:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，渗透：[t2,r-1,c3]/[t2,r-1,c4]`;
 
 const reportsList = document.querySelector("#reportsList");
 const parseSectionsList = document.querySelector("#parseSectionsList");
@@ -69,7 +72,7 @@ async function init() {
 
   accountInput.value = credentials.account || "";
   passwordInput.value = credentials.password || "";
-  templateArea.value = stored.outputTemplate || DEFAULT_OUTPUT_TEMPLATE;
+  templateArea.value = normalizeInitialOutputTemplate(stored.outputTemplate);
   outputArea.value = stored.runLog || "";
 
   render();
@@ -328,6 +331,14 @@ function normalizeReports(value) {
     id: report.id || createId(),
     url: report.url || ""
   }));
+}
+
+function normalizeInitialOutputTemplate(value) {
+  const template = String(value || "");
+  if (!template || template === LEGACY_DEFAULT_OUTPUT_TEMPLATE) {
+    return DEFAULT_OUTPUT_TEMPLATE;
+  }
+  return template;
 }
 
 function isLegacyDefaultReports(value) {

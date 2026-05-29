@@ -17,9 +17,12 @@ const DEFAULT_PARSE_SECTIONS = [
   }
 ];
 
-const DEFAULT_OUTPUT_TEMPLATE = `- [code]
+const LEGACY_DEFAULT_OUTPUT_TEMPLATE = `- [code]
 \t- [t1]解析结果是:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
 \t- [t2]解析结果是:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，[t2,h3] [t2,r-1,c3]，[t2,h4] [t2,r-1,c4]`;
+const DEFAULT_OUTPUT_TEMPLATE = `[code]
+消耗量级:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
+指标:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，渗透：[t2,r-1,c3]/[t2,r-1,c4]`;
 
 const CONTENT_SCRIPT_FILE = "content.js";
 const TAB_LOAD_TIMEOUT_MS = 60000;
@@ -69,7 +72,7 @@ async function initializeDefaults() {
     next.parseSections = DEFAULT_PARSE_SECTIONS;
   }
 
-  if (!stored.outputTemplate) {
+  if (!stored.outputTemplate || stored.outputTemplate === LEGACY_DEFAULT_OUTPUT_TEMPLATE) {
     next.outputTemplate = DEFAULT_OUTPUT_TEMPLATE;
   }
 
@@ -338,6 +341,9 @@ function normalizeParseSections(value) {
 
 function normalizeOutputTemplate(value) {
   const template = String(value || "").trimEnd();
+  if (template === LEGACY_DEFAULT_OUTPUT_TEMPLATE) {
+    return DEFAULT_OUTPUT_TEMPLATE;
+  }
   return template || DEFAULT_OUTPUT_TEMPLATE;
 }
 
