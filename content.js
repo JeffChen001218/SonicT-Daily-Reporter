@@ -12,6 +12,7 @@
   const TEMPLATE_FIELD_STALE_RETRY_MS = 60000;
   const DATE_HEADER_PATTERN = /^(日期|时间|date|day)$/i;
   const DATE_CELL_PATTERN = /^\d{4}-\d{2}-\d{2}(?:\([^)]*\))?$/;
+  const VXE_TABLE_WRAPPER_SELECTOR = "[class*='vxe-table--main-wrapper']";
   const PANEL_STATUS_OVERLAY_ID = "__sonic_daily_panel_status_overlay__";
   const PANEL_STATUS_LOG_LIMIT = 12;
 
@@ -297,9 +298,13 @@
   }
 
   function parseAllSections({ parseSections, rowTargets, rowOffsets, templateRequirements, log, silent }) {
-    const models = collectTableModels();
     const sectionContexts = buildSectionContexts(parseSections);
     const parseLog = silent ? () => {} : log;
+    let nextModelIndex = 0;
+    const sectionModelGroups = sectionContexts.map((sectionContext) =>
+      collectSectionTableModels(sectionContext, () => nextModelIndex++)
+    );
+    const models = sectionModelGroups.flat();
 
     const sections = parseSections.map((section, index) =>
       parseSection(
@@ -308,7 +313,7 @@
           key: `t${index + 1}`,
           index: index + 1
         },
-        models,
+        sectionModelGroups[index],
         {
           sectionContext: sectionContexts[index],
           sectionRequirements: getSectionTemplateRequirements(templateRequirements, index),
@@ -319,7 +324,7 @@
       )
     );
     const diagnostics = sections.map((section, index) =>
-      buildPanelStatusDiagnostics(section, sectionContexts[index], models)
+      buildPanelStatusDiagnostics(section, sectionContexts[index], sectionModelGroups[index])
     );
 
     updatePanelStatusOverlay(diagnostics);
@@ -334,9 +339,12 @@
   function buildPanelStatusDiagnostics(section, sectionContext, models) {
     const titleRect = sectionContext?.titleNode?.getBoundingClientRect();
     const progressNodes = findSectionNodes(".n-progress", sectionContext);
-    const tableWrapperNodes = findSectionNodes(".vxe-table--main-wrapper", sectionContext);
+    const tableWrapperNodes = findSectionTableWrappers(sectionContext);
     const visibleTableWrapperCount = tableWrapperNodes.filter(isVisible).length;
-    const candidates = collectSectionModels(models, sectionContext);
+    const tableWrapperTops = tableWrapperNodes.map((node) => Math.round(node.getBoundingClientRect().top)).join(",");
+    const candidates = models || [];
+    const scopeClass = cleanText(sectionContext?.scope?.className || "").slice(0, 80);
+    const refreshButtonCount = findSectionRefreshButtons(sectionContext).length;
 
     return {
       index: section.index,
@@ -347,9 +355,12 @@
       titleText: sectionContext?.titleNode ? cleanText(getVisibleText(sectionContext.titleNode)).slice(0, 120) : "",
       titleTop: Number.isFinite(titleRect?.top) ? Math.round(titleRect.top) : null,
       scopeTag: sectionContext?.scope?.tagName?.toLowerCase?.() || "",
+      scopeClass,
+      refreshButtonCount,
       progressCount: progressNodes.length,
       tableWrapperCount: tableWrapperNodes.length,
       visibleTableWrapperCount,
+      tableWrapperTops,
       candidateTableCount: candidates.length,
       matchedTableIndex: section.tableIndex,
       error: section.error || ""
@@ -366,9 +377,12 @@
       titleText: "",
       titleTop: null,
       scopeTag: "",
+      scopeClass: "",
+      refreshButtonCount: 0,
       progressCount: 0,
       tableWrapperCount: 0,
       visibleTableWrapperCount: 0,
+      tableWrapperTops: "",
       candidateTableCount: 0,
       matchedTableIndex: -1,
       error: "等待开始判断"
@@ -394,6 +408,7 @@
           row.matched ? "matched" : "unmatched",
           row.progressCount,
           row.visibleTableWrapperCount,
+          row.tableWrapperTops,
           row.candidateTableCount,
           row.matchedTableIndex,
           row.error
@@ -670,12 +685,15 @@
     meta.className = "meta";
     meta.textContent = [
       `关键词:${row.matched ? "已匹配" : "未匹配"}`,
+      `刷新按钮:${row.refreshButtonCount || 0}`,
       `进度:${row.progressCount}`,
       `wrapper:${row.visibleTableWrapperCount}/${row.tableWrapperCount}`,
+      row.tableWrapperTops ? `wrapperTop:${row.tableWrapperTops}` : "",
       `候选表格:${row.candidateTableCount}`,
       `命中表格:${row.matchedTableIndex >= 0 ? `#${row.matchedTableIndex}` : "-"}`,
       row.titleTop === null ? "" : `top:${row.titleTop}`,
       row.scopeTag ? `scope:${row.scopeTag}` : "",
+      row.scopeClass ? `scopeClass:${row.scopeClass}` : "",
       row.titleText ? `标题:${row.titleText}` : "",
       row.error ? `原因:${row.error}` : ""
     ]
@@ -725,7 +743,7 @@
       return {
         title: section.title,
         titleNode,
-        scope: null,
+        scope: findPanelDataScope(titleNode),
         band: {
           top: rect.top - 16,
           bottom: Infinity
@@ -745,7 +763,6 @@
       const titleRect = context.titleNode.getBoundingClientRect();
       const nextTop = titleTops.find((top) => top > titleRect.top + 8) ?? titleRect.top + 1400;
       context.band.bottom = nextTop - 8;
-      context.scope = findSectionScope(context.titleNode, context.band);
     });
 
     return contexts;
@@ -765,6 +782,11 @@
         if (exactA !== exactB) {
           return exactA - exactB;
         }
+        const h3A = a.node.tagName?.toLowerCase() === "h3" ? 0 : 1;
+        const h3B = b.node.tagName?.toLowerCase() === "h3" ? 0 : 1;
+        if (h3A !== h3B) {
+          return h3A - h3B;
+        }
         if (a.rect.top !== b.rect.top) {
           return a.rect.top - b.rect.top;
         }
@@ -772,38 +794,12 @@
       })[0]?.node || null;
   }
 
-  function findSectionScope(titleNode, band) {
-    const titleRect = titleNode.getBoundingClientRect();
-    let node = titleNode.parentElement;
-
-    for (let depth = 0; depth < 8 && node && node !== document.body; depth += 1) {
-      const rect = node.getBoundingClientRect();
-      const extendsBelowTitle = rect.bottom >= titleRect.bottom + 80;
-      const insideBand = rect.top <= titleRect.top + 8 && rect.top >= band.top - 80 && rect.bottom <= band.bottom + 160;
-      if (insideBand && rect.width >= 240 && extendsBelowTitle) {
-        return node;
-      }
+  function findPanelDataScope(titleNode) {
+    let node = titleNode;
+    for (let depth = 0; depth < 3 && node?.parentElement; depth += 1) {
       node = node.parentElement;
     }
-
-    return titleNode.parentElement || titleNode;
-  }
-
-  function collectSectionModels(models, sectionContext) {
-    return models.filter((model) => isModelInSectionContext(model, sectionContext));
-  }
-
-  function isModelInSectionContext(model, sectionContext) {
-    if (!model?.root || !sectionContext?.band) {
-      return false;
-    }
-
-    if (sectionContext.scope?.contains(model.root)) {
-      return true;
-    }
-
-    const rect = model.root.getBoundingClientRect();
-    return rect.bottom >= sectionContext.band.top && rect.top <= sectionContext.band.bottom;
+    return node || null;
   }
 
   function inspectSectionPanelState(sectionContext) {
@@ -811,6 +807,13 @@
       return {
         status: "loading",
         error: "等待匹配预设面板关键词"
+      };
+    }
+
+    if (hasSectionRefreshButton(sectionContext)) {
+      return {
+        status: "failed",
+        error: "面板出现刷新按钮，需要刷新网页重新加载"
       };
     }
 
@@ -836,31 +839,52 @@
   }
 
   function hasSectionTableWrapper(sectionContext) {
-    return findSectionNodes(".vxe-table--main-wrapper", sectionContext).length > 0;
+    return findSectionTableWrappers(sectionContext).length > 0;
   }
 
-  function findSectionNodes(selector, sectionContext) {
-    if (!sectionContext?.band) {
+  function hasSectionRefreshButton(sectionContext) {
+    return findSectionRefreshButtons(sectionContext).length > 0;
+  }
+
+  function findSectionRefreshButtons(sectionContext) {
+    return findSectionNodes(
+      [
+        "button",
+        "input[type='button']",
+        "input[type='submit']",
+        "[role='button']",
+        ".ant-btn",
+        ".el-button",
+        ".arco-btn",
+        ".semi-button"
+      ].join(","),
+      sectionContext
+    )
+      .filter(isVisible)
+      .filter((node) => getButtonText(node).replace(/\s+/g, "") === "刷新");
+  }
+
+  function collectSectionTableModels(sectionContext, nextIndex) {
+    return findSectionTableWrappers(sectionContext)
+      .filter(isVisible)
+      .map((root) => buildTableModel(root, nextIndex(), sectionContext))
+      .filter((model) => model.rows.length);
+  }
+
+  function findSectionTableWrappers(sectionContext) {
+    if (!sectionContext?.scope) {
       return [];
     }
 
-    return Array.from(document.querySelectorAll(selector)).filter((node) =>
-      isNodeInSectionContext(node, sectionContext)
-    );
+    return Array.from(sectionContext.scope.querySelectorAll(VXE_TABLE_WRAPPER_SELECTOR));
   }
 
-  function isNodeInSectionContext(node, sectionContext) {
-    if (!sectionContext?.band) {
-      return false;
+  function findSectionNodes(selector, sectionContext) {
+    if (!sectionContext?.scope) {
+      return [];
     }
 
-    if (sectionContext.scope?.contains(node)) {
-      return true;
-    }
-
-    const rect = node.getBoundingClientRect();
-    const centerY = rect.top + rect.height / 2;
-    return centerY >= sectionContext.band.top && centerY <= sectionContext.band.bottom;
+    return Array.from(sectionContext.scope.querySelectorAll(selector));
   }
 
   function normalizeTemplateRequirements(value) {
@@ -913,8 +937,8 @@
       }
 
       const dataCells = getTemplateCells(sectionLike, String(offset));
-      if (dataCells.filter(isValidDataCell).length < 2) {
-        problems.push(`r${offset} 行数据无效`);
+      if (!dataCells.length) {
+        problems.push(`r${offset} 行无数据`);
       }
     });
 
@@ -943,7 +967,7 @@
   }
 
   function isValidDataCell(value) {
-    return !isReplaceableCellText(value);
+    return Boolean(cleanText(value));
   }
 
   function getTemplateHeaders(section) {
@@ -999,7 +1023,7 @@
 
   function parseSection(section, models, context) {
     const sectionContext = context.sectionContext || {};
-    const candidates = collectSectionModels(models, sectionContext);
+    const candidates = Array.isArray(models) ? models : [];
     const debugPrefix = `[${section.title}]`;
     context.log(`${debugPrefix} 候选表格 ${candidates.length} 个`);
     const panelState = inspectSectionPanelState(sectionContext);
@@ -1066,6 +1090,8 @@
       const bestMatch = matches[0];
 
       context.log(`${debugPrefix} 命中表格 #${bestMatch.model.index}`, {
+        sourceTitle: bestMatch.model.sourceTitle,
+        sourceWrapperTop: bestMatch.model.sourceWrapperTop,
         headers: bestMatch.model.headers,
         rows: bestMatch.rows,
         validation: bestMatch.validation
@@ -1085,6 +1111,8 @@
         status,
         panelLoaded: true,
         tableIndex: bestMatch.model.index,
+        sourceTitle: bestMatch.model.sourceTitle,
+        sourceWrapperTop: bestMatch.model.sourceWrapperTop,
         headers: bestMatch.model.headers,
         rows: bestMatch.rows,
         error: bestMatch.validation.error
@@ -1128,8 +1156,7 @@
   function scoreSectionMatch(model, rows, missingOffsets, validation) {
     const headerCount = Array.isArray(model.headers) ? model.headers.filter(Boolean).length : 0;
     const cells = Object.values(rows).flatMap((row) => row.cells || []);
-    const realCellCount = cells.filter((cell) => cell && !isPlaceholderCellText(cell)).length;
-    const placeholderCount = cells.filter(isPlaceholderCellText).length;
+    const realCellCount = cells.filter((cell) => cleanText(cell)).length;
     const rowCoverage = Object.values(rows).reduce((sum, row) => {
       const cellCount = Array.isArray(row.cells) ? row.cells.length : 0;
       return sum + Math.min(cellCount, headerCount || cellCount);
@@ -1141,39 +1168,12 @@
       headerCount * 20 +
       realCellCount * 4 +
       rowCoverage * 2 -
-      placeholderCount * 15 -
       missingOffsets.length * 100
     );
   }
 
-  function collectTableModels() {
-    const roots = new Set();
-    const selectors = [
-      ".ant-table",
-      ".el-table",
-      ".vxe-table",
-      ".vxe-table--main-wrapper",
-      ".arco-table",
-      ".semi-table",
-      "[role='table']",
-      "table"
-    ].join(",");
-
-    document.querySelectorAll(selectors).forEach((node) => {
-      const root =
-        node.closest(".ant-table,.el-table,.vxe-table,.arco-table,.semi-table,[role='table']") ||
-        node;
-      if (isVisible(root)) {
-        roots.add(root);
-      }
-    });
-
-    return Array.from(roots)
-      .map((root, index) => buildTableModel(root, index))
-      .filter((model) => model.rows.length);
-  }
-
-  function buildTableModel(root, index) {
+  function buildTableModel(root, index, sectionContext) {
+    const rect = root.getBoundingClientRect();
     const headerRows = collectHeaderRows(root);
     const bodyRows = collectBodyRows(root, headerRows);
     const headerInfos = buildHeaderInfos(headerRows);
@@ -1183,6 +1183,8 @@
     return {
       index,
       root,
+      sourceTitle: sectionContext?.title || "",
+      sourceWrapperTop: Number.isFinite(rect.top) ? Math.round(rect.top) : null,
       headers,
       headerInfos,
       rows
@@ -1265,9 +1267,7 @@
 
       const tolerance = Math.max(40, header.width * 0.9);
       const nearCandidates = candidates.filter((candidate) => candidate.distance <= tolerance);
-      const best =
-        nearCandidates.find((candidate) => !isPlaceholderCellText(candidate.cell.text)) ||
-        nearCandidates[0];
+      const best = nearCandidates[0];
 
       if (!best) {
         return "";
@@ -1279,14 +1279,6 @@
 
     const filledCount = aligned.filter(Boolean).length;
     return filledCount >= Math.min(headerColumns.length, rawCells.length) - 1 ? aligned : rawCells;
-  }
-
-  function isPlaceholderCellText(value) {
-    return /^[-–—\s]+$/.test(String(value || ""));
-  }
-
-  function isReplaceableCellText(value) {
-    return !cleanText(value) || isPlaceholderCellText(value);
   }
 
   function getHeaderColumns(headers, headerInfos) {
@@ -1455,11 +1447,12 @@
   }
 
   function findTitleNodes(title) {
-    const candidates = Array.from(
-      document.querySelectorAll(
-        "h1,h2,h3,h4,h5,h6,header,section,article,div,span,p,.ant-card-head-title,.el-card__header"
+    const candidates = uniqueNodes([
+      ...document.querySelectorAll("h3"),
+      ...document.querySelectorAll(
+        "h1,h2,h4,h5,h6,header,section,article,div,span,p,.ant-card-head-title,.el-card__header"
       )
-    ).filter((node) => {
+    ]).filter((node) => {
       if (!isVisible(node)) {
         return false;
       }

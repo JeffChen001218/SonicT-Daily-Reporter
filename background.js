@@ -518,7 +518,7 @@ function resolvePlaceholder(token, result) {
   if (match) {
     const section = getSection(result, Number(match[1]));
     const headerIndex = Number(match[2]) - 1;
-    return getTemplateHeaders(section)[headerIndex] || "";
+    return valueOrEmpty(getTemplateHeaders(section)[headerIndex]);
   }
 
   match = /^t(\d+),r([+-]?\d+),c(\d+)$/i.exec(token);
@@ -526,7 +526,7 @@ function resolvePlaceholder(token, result) {
     const section = getSection(result, Number(match[1]));
     const rowOffset = String(Number(match[2]));
     const columnIndex = Number(match[3]) - 1;
-    return getTemplateCells(section, rowOffset)[columnIndex] || "";
+    return valueOrEmpty(getTemplateCells(section, rowOffset)[columnIndex]);
   }
 
   return "";
@@ -534,6 +534,10 @@ function resolvePlaceholder(token, result) {
 
 function getSection(result, sectionNumber) {
   return result?.sections?.[sectionNumber - 1] || null;
+}
+
+function valueOrEmpty(value) {
+  return value === undefined || value === null ? "" : String(value);
 }
 
 function getTemplateHeaders(section) {
