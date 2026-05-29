@@ -20,13 +20,19 @@ const DEFAULT_PARSE_SECTIONS = [
 const LEGACY_DEFAULT_OUTPUT_TEMPLATE = `- [code]
 \t- [t1]解析结果是:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
 \t- [t2]解析结果是:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，[t2,h3] [t2,r-1,c3]，[t2,h4] [t2,r-1,c4]`;
-const DEFAULT_OUTPUT_TEMPLATE = `[code]
+const PREVIOUS_DEFAULT_OUTPUT_TEMPLATE = `[code]
 消耗量级:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
+指标:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，渗透：[t2,r-1,c3]/[t2,r-1,c4]`;
+const DEFAULT_OUTPUT_TEMPLATE = `[code]
+消耗量级:[t1,r-1,c1]，毛利：[t1,r-1,c6]
 指标:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，渗透：[t2,r-1,c3]/[t2,r-1,c4]`;
 
 const CONTENT_SCRIPT_FILE = "content.js";
 const TAB_LOAD_TIMEOUT_MS = 60000;
-const SNIFF_TIMEOUT_MS = 95000;
+const SNIFF_TIMEOUT_MS = 240000;
+const MAX_SNIFF_ATTEMPTS = 8;
+const DATE_HEADER_PATTERN = /^(日期|时间|date|day)$/i;
+const DATE_CELL_PATTERN = /^\d{4}-\d{2}-\d{2}(?:\([^)]*\))?$/;
 
 let activeRun = {
   running: false,
@@ -72,7 +78,11 @@ async function initializeDefaults() {
     next.parseSections = DEFAULT_PARSE_SECTIONS;
   }
 
-  if (!stored.outputTemplate || stored.outputTemplate === LEGACY_DEFAULT_OUTPUT_TEMPLATE) {
+  if (
+    !stored.outputTemplate ||
+    stored.outputTemplate === LEGACY_DEFAULT_OUTPUT_TEMPLATE ||
+    stored.outputTemplate === PREVIOUS_DEFAULT_OUTPUT_TEMPLATE
+  ) {
     next.outputTemplate = DEFAULT_OUTPUT_TEMPLATE;
   }
 
@@ -114,6 +124,7 @@ async function startRun(payload) {
   const parseSections = normalizeParseSections(payload.parseSections);
   const outputTemplate = normalizeOutputTemplate(payload.outputTemplate);
   const rowOffsets = collectRowOffsetsFromTemplate(outputTemplate);
+  const templateRequirements = collectTemplateRequirements(outputTemplate);
 
   activeRun = {
     running: true,
@@ -140,7 +151,14 @@ async function startRun(payload) {
     runtimeState: publicRuntimeState()
   });
 
-  void runQueue(reports, credentials, parseSections, outputTemplate, rowOffsets).catch(async (error) => {
+  void runQueue(
+    reports,
+    credentials,
+    parseSections,
+    outputTemplate,
+    rowOffsets,
+    templateRequirements
+  ).catch(async (error) => {
     activeRun.running = false;
     activeRun.currentTabId = null;
     await persistRuntimeState();
@@ -173,7 +191,14 @@ async function getState() {
   };
 }
 
-async function runQueue(reports, credentials, parseSections, outputTemplate, rowOffsets) {
+async function runQueue(
+  reports,
+  credentials,
+  parseSections,
+  outputTemplate,
+  rowOffsets,
+  templateRequirements
+) {
   for (let index = 0; index < reports.length; index += 1) {
     const report = reports[index];
     let openedTabId = null;
@@ -203,6 +228,7 @@ async function runQueue(reports, credentials, parseSections, outputTemplate, row
         credentials,
         parseSections,
         rowOffsets,
+        templateRequirements,
         timeoutMs: SNIFF_TIMEOUT_MS
       });
 
@@ -235,7 +261,7 @@ async function runQueue(reports, credentials, parseSections, outputTemplate, row
 async function runSniffOnTab(tabId, payload) {
   let lastError = null;
 
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 1; attempt <= MAX_SNIFF_ATTEMPTS; attempt += 1) {
     if (activeRun.shouldStop) {
       return {
         ok: false,
@@ -253,8 +279,16 @@ async function runSniffOnTab(tabId, payload) {
 
       if (response?.needsRetry) {
         lastError = new Error(response.error || "页面发生跳转，准备重试");
+        if (payload.report?.id) {
+          await setReportStatus(
+            payload.report.id,
+            "刷新重试",
+            `第 ${attempt}/${MAX_SNIFF_ATTEMPTS} 次：${messageFromError(lastError)}`
+          );
+        }
+        await tabsReload(tabId).catch(() => null);
         await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
-        await sleep(1200);
+        await sleep(2000);
         continue;
       }
 
@@ -341,7 +375,7 @@ function normalizeParseSections(value) {
 
 function normalizeOutputTemplate(value) {
   const template = String(value || "").trimEnd();
-  if (template === LEGACY_DEFAULT_OUTPUT_TEMPLATE) {
+  if (template === LEGACY_DEFAULT_OUTPUT_TEMPLATE || template === PREVIOUS_DEFAULT_OUTPUT_TEMPLATE) {
     return DEFAULT_OUTPUT_TEMPLATE;
   }
   return template || DEFAULT_OUTPUT_TEMPLATE;
@@ -362,6 +396,54 @@ function collectRowOffsetsFromTemplate(template) {
   }
 
   return Array.from(offsets).sort((a, b) => a - b);
+}
+
+function collectTemplateRequirements(template) {
+  const cells = [];
+  const headers = [];
+  const seenCells = new Set();
+  const seenHeaders = new Set();
+  const pattern = /\[([^\]]+)\]/g;
+  let match = pattern.exec(template);
+
+  while (match) {
+    const token = match[1].trim();
+    let tokenMatch = /^t(\d+),r([+-]?\d+),c(\d+)$/i.exec(token);
+    if (tokenMatch) {
+      const item = {
+        sectionIndex: Number(tokenMatch[1]) - 1,
+        rowOffset: Number(tokenMatch[2]),
+        columnIndex: Number(tokenMatch[3]) - 1
+      };
+      const key = `${item.sectionIndex}:${item.rowOffset}:${item.columnIndex}`;
+      if (!seenCells.has(key)) {
+        seenCells.add(key);
+        cells.push(item);
+      }
+      match = pattern.exec(template);
+      continue;
+    }
+
+    tokenMatch = /^t(\d+),h(\d+)$/i.exec(token);
+    if (tokenMatch) {
+      const item = {
+        sectionIndex: Number(tokenMatch[1]) - 1,
+        columnIndex: Number(tokenMatch[2]) - 1
+      };
+      const key = `${item.sectionIndex}:${item.columnIndex}`;
+      if (!seenHeaders.has(key)) {
+        seenHeaders.add(key);
+        headers.push(item);
+      }
+    }
+
+    match = pattern.exec(template);
+  }
+
+  return {
+    cells,
+    headers
+  };
 }
 
 async function setReportStatus(reportId, status, detail = "") {
@@ -436,7 +518,7 @@ function resolvePlaceholder(token, result) {
   if (match) {
     const section = getSection(result, Number(match[1]));
     const headerIndex = Number(match[2]) - 1;
-    return section?.headers?.[headerIndex] || "";
+    return getTemplateHeaders(section)[headerIndex] || "";
   }
 
   match = /^t(\d+),r([+-]?\d+),c(\d+)$/i.exec(token);
@@ -444,7 +526,7 @@ function resolvePlaceholder(token, result) {
     const section = getSection(result, Number(match[1]));
     const rowOffset = String(Number(match[2]));
     const columnIndex = Number(match[3]) - 1;
-    return section?.rows?.[rowOffset]?.cells?.[columnIndex] || "";
+    return getTemplateCells(section, rowOffset)[columnIndex] || "";
   }
 
   return "";
@@ -452,6 +534,37 @@ function resolvePlaceholder(token, result) {
 
 function getSection(result, sectionNumber) {
   return result?.sections?.[sectionNumber - 1] || null;
+}
+
+function getTemplateHeaders(section) {
+  const headers = Array.isArray(section?.headers) ? section.headers : [];
+  return headers.slice(getLeadingDimensionColumnCount(section));
+}
+
+function getTemplateCells(section, rowOffset) {
+  const cells = Array.isArray(section?.rows?.[rowOffset]?.cells) ? section.rows[rowOffset].cells : [];
+  return cells.slice(getLeadingDimensionColumnCount(section));
+}
+
+function getLeadingDimensionColumnCount(section) {
+  const headers = Array.isArray(section?.headers) ? section.headers : [];
+  const firstHeader = normalizeCellText(headers[0]);
+  if (DATE_HEADER_PATTERN.test(firstHeader)) {
+    return 1;
+  }
+
+  const rows = Object.values(section?.rows || {});
+  if (rows.some((row) => DATE_CELL_PATTERN.test(normalizeCellText(row?.cells?.[0])))) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function normalizeCellText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function hasParseProblem(result) {
@@ -535,6 +648,10 @@ function tabsUpdate(tabId, value) {
 
 function tabsRemove(tabId) {
   return callbackPromise((callback) => chrome.tabs.remove(tabId, callback));
+}
+
+function tabsReload(tabId) {
+  return callbackPromise((callback) => chrome.tabs.reload(tabId, callback));
 }
 
 function windowsUpdate(windowId, value) {

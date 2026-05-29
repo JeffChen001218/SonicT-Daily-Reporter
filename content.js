@@ -6,9 +6,20 @@
 
   const WEEKDAYS = ["日", "一", "二", "三", "四", "五", "六"];
   const DEFAULT_TIMEOUT_MS = 90000;
+  const PARSE_RETRY_INTERVAL_MS = 1500;
   const DEFAULT_ROW_OFFSETS = [-1];
+  const PANEL_TABLE_MISSING_RETRY_MS = 12000;
+  const TEMPLATE_FIELD_STALE_RETRY_MS = 60000;
+  const DATE_HEADER_PATTERN = /^(日期|时间|date|day)$/i;
+  const DATE_CELL_PATTERN = /^\d{4}-\d{2}-\d{2}(?:\([^)]*\))?$/;
+  const PANEL_STATUS_OVERLAY_ID = "__sonic_daily_panel_status_overlay__";
+  const PANEL_STATUS_LOG_LIMIT = 12;
 
   let cancelRequested = false;
+  let panelStatusOverlayRows = [];
+  let panelStatusOverlayLog = [];
+  let panelStatusOverlayLastFingerprint = "";
+  let panelStatusOverlayHidden = false;
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "PING") {
@@ -46,6 +57,7 @@
     const debug = [];
     const parseSections = normalizeParseSections(payload.parseSections);
     const rowOffsets = normalizeRowOffsets(payload.rowOffsets);
+    const templateRequirements = normalizeTemplateRequirements(payload.templateRequirements);
     const rowTargets = Object.fromEntries(
       rowOffsets.map((offset) => {
         const date = getDateByOffset(offset);
@@ -69,23 +81,19 @@
         text: line
       });
       sendContentLog(line);
+      addPanelStatusOverlayLog(line);
     };
 
+    resetPanelStatusOverlay(parseSections);
     log(`开始页面嗅探，解析板块 ${parseSections.map((section) => section.title).join("、") || "未配置"}`);
     log(`目标行 ${Object.values(rowTargets).map((target) => `r${target.offset}:${target.label}`).join("、")}`);
     await waitForDomReady();
+    renderPanelStatusOverlay();
 
     const loginResult = await maybeLogin(payload.credentials || {}, log);
     if (loginResult.attempted) {
       log(loginResult.clicked ? "已尝试自动登录，等待页面进入报表" : "已填充登录信息，未找到明确登录按钮");
-      await waitForReportReady(parseSections, Object.values(rowTargets), timeoutMs, log).catch((error) => {
-        log(`登录后等待报表超时：${messageFromError(error)}`);
-      });
     }
-
-    await waitForReportReady(parseSections, Object.values(rowTargets), timeoutMs, log).catch((error) => {
-      log(`等待报表超时：${messageFromError(error)}`);
-    });
 
     throwIfStopped();
 
@@ -96,27 +104,37 @@
       log("项目code未命中，已按 sonic_T????-.* 全局查询");
     }
 
-    const models = collectTableModels();
-    log(`发现表格候选 ${models.length} 个`);
+    const parseResult = await waitForCompleteParse({
+      parseSections,
+      rowTargets,
+      rowOffsets,
+      templateRequirements,
+      timeoutMs,
+      log
+    });
+    const sections = parseResult.sections;
 
-    const sections = parseSections.map((section, index) =>
-      parseSection(
-        {
-          ...section,
-          key: `t${index + 1}`,
-          index: index + 1
-        },
-        models,
-        {
+    if (parseResult.needsRetry) {
+      return {
+        ok: false,
+        needsRetry: true,
+        error: parseResult.error,
+        result: {
+          url: location.href,
+          title: document.title,
+          projectCode: projectCodeMatch.code,
+          projectCodeMatch: projectCodeMatch.fullMatch,
+          targetDateText: primaryTarget?.dateText || "",
+          targetDateLabel: primaryTarget?.label || "",
           rowTargets,
-          rowOffsets,
-          log
+          sections,
+          debug
         }
-      )
-    );
+      };
+    }
 
     return {
-      ok: sections.some((section) => section.ok),
+      ok: isCompleteParse(sections, parseSections, templateRequirements),
       result: {
         url: location.href,
         title: document.title,
@@ -185,20 +203,772 @@
     };
   }
 
-  async function waitForReportReady(parseSections, rowTargets, timeoutMs, log) {
-    await waitForCondition(
-      () => {
-        throwIfStopped();
-        const pageText = getVisibleText(document.body);
-        const hasSection =
-          !parseSections.length || parseSections.some((section) => pageText.includes(section.title));
-        const hasDate = rowTargets.some((target) => pageText.includes(target.dateText));
-        return hasSection && hasDate;
-      },
-      timeoutMs,
-      800
+  async function waitForCompleteParse(options) {
+    const startedAt = Date.now();
+    let lastResult = parseAllSections({
+      ...options,
+      silent: true
+    });
+    let lastSummary = "";
+    let tableMissingSince = 0;
+    let templatePendingSince = 0;
+
+    while (Date.now() - startedAt < options.timeoutMs) {
+      throwIfStopped();
+      lastResult = parseAllSections({
+        ...options,
+        silent: true
+      });
+
+      if (lastResult.sections.some((section) => section.status === "loading")) {
+        tableMissingSince = 0;
+        templatePendingSince = 0;
+        const summary = summarizeParseWaiting(lastResult.sections, options.templateRequirements);
+        if (summary !== lastSummary) {
+          options.log(`等待板块加载：${summary}`);
+          lastSummary = summary;
+        }
+        await sleep(PARSE_RETRY_INTERVAL_MS);
+        continue;
+      }
+
+      if (lastResult.sections.some((section) => section.status === "failed")) {
+        return createRetryParseResult(lastResult, summarizeParseWaiting(lastResult.sections, options.templateRequirements));
+      }
+
+      if (lastResult.sections.some((section) => section.status === "no-table")) {
+        templatePendingSince = 0;
+        tableMissingSince ||= Date.now();
+        if (Date.now() - tableMissingSince >= PANEL_TABLE_MISSING_RETRY_MS) {
+          return createRetryParseResult(
+            lastResult,
+            `板块状态按钮已消失，但表格未正常展示：${summarizeParseWaiting(lastResult.sections, options.templateRequirements)}`
+          );
+        }
+        const summary = summarizeParseWaiting(lastResult.sections, options.templateRequirements);
+        if (summary !== lastSummary) {
+          options.log(`等待板块表格：${summary}`);
+          lastSummary = summary;
+        }
+        await sleep(PARSE_RETRY_INTERVAL_MS);
+        continue;
+      }
+
+      tableMissingSince = 0;
+
+      if (isCompleteParse(lastResult.sections, options.parseSections, options.templateRequirements)) {
+        options.log(`所有板块表格与模板字段已解析完成，表格候选 ${lastResult.models.length} 个`);
+        return lastResult;
+      }
+
+      const summary = summarizeParseWaiting(lastResult.sections, options.templateRequirements);
+      const hasPendingFieldsOrRows = lastResult.sections.some((section) =>
+        ["missing-row", "invalid-row"].includes(section.status)
+      );
+      if (hasPendingFieldsOrRows) {
+        templatePendingSince ||= Date.now();
+        if (Date.now() - templatePendingSince >= TEMPLATE_FIELD_STALE_RETRY_MS) {
+          return createRetryParseResult(lastResult, `表格已展示，但目标行或模板字段长时间未完成：${summary}`);
+        }
+      } else {
+        templatePendingSince = 0;
+      }
+
+      if (summary !== lastSummary) {
+        options.log(`等待所有配置板块解析完成：${summary}`);
+        lastSummary = summary;
+      }
+
+      await sleep(PARSE_RETRY_INTERVAL_MS);
+    }
+
+    return createRetryParseResult(
+      lastResult,
+      `等待完整解析超时：${summarizeParseWaiting(lastResult.sections, options.templateRequirements)}`
     );
-    log("页面中已发现目标日期和配置板块文字");
+  }
+
+  function createRetryParseResult(lastResult, error) {
+    return {
+      ...lastResult,
+      needsRetry: true,
+      error
+    };
+  }
+
+  function parseAllSections({ parseSections, rowTargets, rowOffsets, templateRequirements, log, silent }) {
+    const models = collectTableModels();
+    const sectionContexts = buildSectionContexts(parseSections);
+    const parseLog = silent ? () => {} : log;
+
+    const sections = parseSections.map((section, index) =>
+      parseSection(
+        {
+          ...section,
+          key: `t${index + 1}`,
+          index: index + 1
+        },
+        models,
+        {
+          sectionContext: sectionContexts[index],
+          sectionRequirements: getSectionTemplateRequirements(templateRequirements, index),
+          rowTargets,
+          rowOffsets,
+          log: parseLog
+        }
+      )
+    );
+    const diagnostics = sections.map((section, index) =>
+      buildPanelStatusDiagnostics(section, sectionContexts[index], models)
+    );
+
+    updatePanelStatusOverlay(diagnostics);
+
+    return {
+      models,
+      sections,
+      diagnostics
+    };
+  }
+
+  function buildPanelStatusDiagnostics(section, sectionContext, models) {
+    const titleRect = sectionContext?.titleNode?.getBoundingClientRect();
+    const progressNodes = findSectionNodes(".n-progress", sectionContext);
+    const tableWrapperNodes = findSectionNodes(".vxe-table--main-wrapper", sectionContext);
+    const visibleTableWrapperCount = tableWrapperNodes.filter(isVisible).length;
+    const candidates = collectSectionModels(models, sectionContext);
+
+    return {
+      index: section.index,
+      title: section.title,
+      status: section.status,
+      ok: Boolean(section.ok),
+      matched: Boolean(sectionContext?.titleNode),
+      titleText: sectionContext?.titleNode ? cleanText(getVisibleText(sectionContext.titleNode)).slice(0, 120) : "",
+      titleTop: Number.isFinite(titleRect?.top) ? Math.round(titleRect.top) : null,
+      scopeTag: sectionContext?.scope?.tagName?.toLowerCase?.() || "",
+      progressCount: progressNodes.length,
+      tableWrapperCount: tableWrapperNodes.length,
+      visibleTableWrapperCount,
+      candidateTableCount: candidates.length,
+      matchedTableIndex: section.tableIndex,
+      error: section.error || ""
+    };
+  }
+
+  function resetPanelStatusOverlay(parseSections) {
+    panelStatusOverlayRows = parseSections.map((section, index) => ({
+      index: index + 1,
+      title: section.title,
+      status: "pending",
+      ok: false,
+      matched: false,
+      titleText: "",
+      titleTop: null,
+      scopeTag: "",
+      progressCount: 0,
+      tableWrapperCount: 0,
+      visibleTableWrapperCount: 0,
+      candidateTableCount: 0,
+      matchedTableIndex: -1,
+      error: "等待开始判断"
+    }));
+    panelStatusOverlayLog = [];
+    panelStatusOverlayLastFingerprint = "";
+    panelStatusOverlayHidden = false;
+    renderPanelStatusOverlay();
+  }
+
+  function updatePanelStatusOverlay(rows) {
+    if (!Array.isArray(rows)) {
+      return;
+    }
+
+    panelStatusOverlayRows = rows;
+    const fingerprint = rows
+      .map((row) =>
+        [
+          row.index,
+          row.status,
+          row.ok ? "ok" : "wait",
+          row.matched ? "matched" : "unmatched",
+          row.progressCount,
+          row.visibleTableWrapperCount,
+          row.candidateTableCount,
+          row.matchedTableIndex,
+          row.error
+        ].join("|")
+      )
+      .join(";");
+
+    if (fingerprint && fingerprint !== panelStatusOverlayLastFingerprint) {
+      panelStatusOverlayLastFingerprint = fingerprint;
+      addPanelStatusOverlayLog(
+        rows
+          .map((row) => `${row.title}:${panelStatusLabel(row)}`)
+          .join("；"),
+        false
+      );
+    }
+
+    renderPanelStatusOverlay();
+  }
+
+  function addPanelStatusOverlayLog(text, shouldRender = true) {
+    const line = cleanText(text);
+    if (!line) {
+      return;
+    }
+
+    panelStatusOverlayLog.unshift({
+      time: new Date().toLocaleTimeString("zh-CN", {
+        hour12: false
+      }),
+      text: line
+    });
+    panelStatusOverlayLog = panelStatusOverlayLog.slice(0, PANEL_STATUS_LOG_LIMIT);
+
+    if (shouldRender) {
+      renderPanelStatusOverlay();
+    }
+  }
+
+  function panelStatusLabel(row) {
+    if (row.ok) {
+      return "解析完成";
+    }
+    if (!row.matched) {
+      return "等待关键词匹配";
+    }
+    if (row.tableWrapperCount > 0) {
+      return `表格已展示 候选=${row.candidateTableCount}`;
+    }
+    if (row.progressCount > 0) {
+      return `加载中 n-progress=${row.progressCount}`;
+    }
+    return row.error || row.status || "等待";
+  }
+
+  function renderPanelStatusOverlay() {
+    if (panelStatusOverlayHidden || !document.documentElement) {
+      return;
+    }
+
+    const overlay = ensurePanelStatusOverlay();
+    if (!overlay) {
+      return;
+    }
+
+    const body = overlay.shadowRoot.querySelector("[data-role='body']");
+    const rows = overlay.shadowRoot.querySelector("[data-role='rows']");
+    const logs = overlay.shadowRoot.querySelector("[data-role='logs']");
+    const summary = overlay.shadowRoot.querySelector("[data-role='summary']");
+
+    if (!body || !rows || !logs || !summary) {
+      return;
+    }
+
+    const completedCount = panelStatusOverlayRows.filter((row) => row.ok).length;
+    summary.textContent = `${completedCount}/${panelStatusOverlayRows.length} 完成`;
+    rows.textContent = "";
+    panelStatusOverlayRows.forEach((row) => rows.append(createPanelStatusRow(row)));
+
+    logs.textContent = "";
+    panelStatusOverlayLog.forEach((item) => {
+      const node = document.createElement("div");
+      node.className = "log-line";
+      node.textContent = `${item.time} ${item.text}`;
+      logs.append(node);
+    });
+
+    body.hidden = overlay.dataset.collapsed === "true";
+  }
+
+  function ensurePanelStatusOverlay() {
+    let overlay = document.getElementById(PANEL_STATUS_OVERLAY_ID);
+    if (overlay?.shadowRoot) {
+      return overlay;
+    }
+
+    overlay = document.createElement("div");
+    overlay.id = PANEL_STATUS_OVERLAY_ID;
+    overlay.dataset.collapsed = "false";
+    const shadow = overlay.attachShadow({
+      mode: "open"
+    });
+
+    shadow.innerHTML = `
+      <style>
+        :host {
+          all: initial;
+          position: fixed;
+          right: 14px;
+          bottom: 14px;
+          z-index: 2147483647;
+          width: min(520px, calc(100vw - 28px));
+          color: #1f2937;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          font-size: 12px;
+          line-height: 1.45;
+        }
+        .panel {
+          overflow: hidden;
+          border: 1px solid rgba(15, 23, 42, 0.16);
+          border-radius: 8px;
+          background: rgba(255, 255, 255, 0.96);
+          box-shadow: 0 14px 36px rgba(15, 23, 42, 0.22);
+          backdrop-filter: blur(8px);
+        }
+        .header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          padding: 9px 10px;
+          border-bottom: 1px solid rgba(15, 23, 42, 0.1);
+          background: #0f172a;
+          color: #ffffff;
+        }
+        .title {
+          display: flex;
+          align-items: baseline;
+          gap: 8px;
+          min-width: 0;
+          font-weight: 700;
+        }
+        .summary {
+          color: rgba(255, 255, 255, 0.72);
+          font-weight: 500;
+        }
+        .actions {
+          display: flex;
+          gap: 6px;
+          flex: 0 0 auto;
+        }
+        button {
+          width: 24px;
+          height: 24px;
+          border: 1px solid rgba(255, 255, 255, 0.24);
+          border-radius: 6px;
+          background: rgba(255, 255, 255, 0.12);
+          color: #ffffff;
+          cursor: pointer;
+          font: inherit;
+          line-height: 1;
+        }
+        .body {
+          max-height: min(520px, calc(100vh - 120px));
+          overflow: auto;
+          padding: 10px;
+        }
+        .rows {
+          display: grid;
+          gap: 8px;
+        }
+        .row {
+          display: grid;
+          grid-template-columns: minmax(92px, 0.85fr) minmax(150px, 1.2fr);
+          gap: 8px 10px;
+          padding: 8px;
+          border: 1px solid rgba(15, 23, 42, 0.1);
+          border-radius: 7px;
+          background: #ffffff;
+        }
+        .row[data-state="ready"] {
+          border-color: rgba(22, 163, 74, 0.36);
+          background: #f0fdf4;
+        }
+        .row[data-state="loading"] {
+          border-color: rgba(37, 99, 235, 0.3);
+          background: #eff6ff;
+        }
+        .row[data-state="failed"] {
+          border-color: rgba(220, 38, 38, 0.32);
+          background: #fef2f2;
+        }
+        .name {
+          min-width: 0;
+          font-weight: 700;
+          color: #111827;
+          overflow-wrap: anywhere;
+        }
+        .state {
+          color: #374151;
+          overflow-wrap: anywhere;
+        }
+        .meta {
+          grid-column: 1 / -1;
+          color: #4b5563;
+          overflow-wrap: anywhere;
+        }
+        .logs-title {
+          margin: 10px 0 6px;
+          color: #111827;
+          font-weight: 700;
+        }
+        .logs {
+          display: grid;
+          gap: 5px;
+          max-height: 180px;
+          overflow: auto;
+          padding: 8px;
+          border-radius: 7px;
+          background: #111827;
+          color: #e5e7eb;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 11px;
+          white-space: pre-wrap;
+          overflow-wrap: anywhere;
+        }
+      </style>
+      <div class="panel">
+        <div class="header">
+          <div class="title">
+            <span>面板判断状态</span>
+            <span class="summary" data-role="summary">0/0 完成</span>
+          </div>
+          <div class="actions">
+            <button type="button" data-action="toggle" title="折叠/展开">-</button>
+            <button type="button" data-action="close" title="关闭">x</button>
+          </div>
+        </div>
+        <div class="body" data-role="body">
+          <div class="rows" data-role="rows"></div>
+          <div class="logs-title">日志</div>
+          <div class="logs" data-role="logs"></div>
+        </div>
+      </div>
+    `;
+
+    shadow.querySelector("[data-action='toggle']").addEventListener("click", () => {
+      overlay.dataset.collapsed = overlay.dataset.collapsed === "true" ? "false" : "true";
+      renderPanelStatusOverlay();
+    });
+    shadow.querySelector("[data-action='close']").addEventListener("click", () => {
+      panelStatusOverlayHidden = true;
+      overlay.remove();
+    });
+
+    document.documentElement.append(overlay);
+    return overlay;
+  }
+
+  function createPanelStatusRow(row) {
+    const node = document.createElement("div");
+    node.className = "row";
+    node.dataset.state = row.ok ? "ready" : row.status || "pending";
+
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = `[t${row.index}] ${row.title}`;
+
+    const state = document.createElement("div");
+    state.className = "state";
+    state.textContent = panelStatusLabel(row);
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = [
+      `关键词:${row.matched ? "已匹配" : "未匹配"}`,
+      `进度:${row.progressCount}`,
+      `wrapper:${row.visibleTableWrapperCount}/${row.tableWrapperCount}`,
+      `候选表格:${row.candidateTableCount}`,
+      `命中表格:${row.matchedTableIndex >= 0 ? `#${row.matchedTableIndex}` : "-"}`,
+      row.titleTop === null ? "" : `top:${row.titleTop}`,
+      row.scopeTag ? `scope:${row.scopeTag}` : "",
+      row.titleText ? `标题:${row.titleText}` : "",
+      row.error ? `原因:${row.error}` : ""
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    node.append(name, state, meta);
+    return node;
+  }
+
+  function isCompleteParse(sections, parseSections, templateRequirements) {
+    return (
+      Array.isArray(sections) &&
+      sections.length === parseSections.length &&
+      sections.every((section) => section.ok)
+    );
+  }
+
+  function summarizeParseWaiting(sections, templateRequirements) {
+    if (!Array.isArray(sections) || !sections.length) {
+      return "尚未解析到配置板块";
+    }
+
+    return sections
+      .map((section) => {
+        if (section.ok) {
+          return `${section.title}:完成`;
+        }
+        return `${section.title}:${section.error || section.status || "等待"}`;
+      })
+      .join("；");
+  }
+
+  function buildSectionContexts(parseSections) {
+    const contexts = parseSections.map((section) => {
+      const titleNode = chooseSectionTitleNode(section.title);
+      if (!titleNode) {
+        return {
+          title: section.title,
+          titleNode: null,
+          scope: null,
+          band: null
+        };
+      }
+
+      const rect = titleNode.getBoundingClientRect();
+      return {
+        title: section.title,
+        titleNode,
+        scope: null,
+        band: {
+          top: rect.top - 16,
+          bottom: Infinity
+        }
+      };
+    });
+
+    const titleTops = contexts
+      .map((context) => context.band?.top)
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+
+    contexts.forEach((context) => {
+      if (!context.titleNode || !context.band) {
+        return;
+      }
+      const titleRect = context.titleNode.getBoundingClientRect();
+      const nextTop = titleTops.find((top) => top > titleRect.top + 8) ?? titleRect.top + 1400;
+      context.band.bottom = nextTop - 8;
+      context.scope = findSectionScope(context.titleNode, context.band);
+    });
+
+    return contexts;
+  }
+
+  function chooseSectionTitleNode(title) {
+    return findTitleNodes(title)
+      .map((node) => ({
+        node,
+        rect: node.getBoundingClientRect(),
+        text: cleanText(getVisibleText(node))
+      }))
+      .filter((item) => Number.isFinite(item.rect.top))
+      .sort((a, b) => {
+        const exactA = a.text === title ? 0 : 1;
+        const exactB = b.text === title ? 0 : 1;
+        if (exactA !== exactB) {
+          return exactA - exactB;
+        }
+        if (a.rect.top !== b.rect.top) {
+          return a.rect.top - b.rect.top;
+        }
+        return a.text.length - b.text.length;
+      })[0]?.node || null;
+  }
+
+  function findSectionScope(titleNode, band) {
+    const titleRect = titleNode.getBoundingClientRect();
+    let node = titleNode.parentElement;
+
+    for (let depth = 0; depth < 8 && node && node !== document.body; depth += 1) {
+      const rect = node.getBoundingClientRect();
+      const extendsBelowTitle = rect.bottom >= titleRect.bottom + 80;
+      const insideBand = rect.top <= titleRect.top + 8 && rect.top >= band.top - 80 && rect.bottom <= band.bottom + 160;
+      if (insideBand && rect.width >= 240 && extendsBelowTitle) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+
+    return titleNode.parentElement || titleNode;
+  }
+
+  function collectSectionModels(models, sectionContext) {
+    return models.filter((model) => isModelInSectionContext(model, sectionContext));
+  }
+
+  function isModelInSectionContext(model, sectionContext) {
+    if (!model?.root || !sectionContext?.band) {
+      return false;
+    }
+
+    if (sectionContext.scope?.contains(model.root)) {
+      return true;
+    }
+
+    const rect = model.root.getBoundingClientRect();
+    return rect.bottom >= sectionContext.band.top && rect.top <= sectionContext.band.bottom;
+  }
+
+  function inspectSectionPanelState(sectionContext) {
+    if (!sectionContext?.titleNode) {
+      return {
+        status: "loading",
+        error: "等待匹配预设面板关键词"
+      };
+    }
+
+    if (hasSectionTableWrapper(sectionContext)) {
+      return {
+        status: "ready",
+        error: ""
+      };
+    }
+
+    const progressNodes = findSectionNodes(".n-progress", sectionContext);
+    if (progressNodes.length) {
+      return {
+        status: "loading",
+        error: `面板仍在加载中，n-progress=${progressNodes.length}`
+      };
+    }
+
+    return {
+      status: "failed",
+      error: "面板加载结束但未展示 vxe-table--main-wrapper"
+    };
+  }
+
+  function hasSectionTableWrapper(sectionContext) {
+    return findSectionNodes(".vxe-table--main-wrapper", sectionContext).length > 0;
+  }
+
+  function findSectionNodes(selector, sectionContext) {
+    if (!sectionContext?.band) {
+      return [];
+    }
+
+    return Array.from(document.querySelectorAll(selector)).filter((node) =>
+      isNodeInSectionContext(node, sectionContext)
+    );
+  }
+
+  function isNodeInSectionContext(node, sectionContext) {
+    if (!sectionContext?.band) {
+      return false;
+    }
+
+    if (sectionContext.scope?.contains(node)) {
+      return true;
+    }
+
+    const rect = node.getBoundingClientRect();
+    const centerY = rect.top + rect.height / 2;
+    return centerY >= sectionContext.band.top && centerY <= sectionContext.band.bottom;
+  }
+
+  function normalizeTemplateRequirements(value) {
+    return {
+      cells: normalizeTemplateRequirementList(value?.cells, true),
+      headers: normalizeTemplateRequirementList(value?.headers, false)
+    };
+  }
+
+  function normalizeTemplateRequirementList(value, includeRowOffset) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return value
+      .map((item) => ({
+        sectionIndex: Number(item?.sectionIndex),
+        rowOffset: includeRowOffset ? Number(item?.rowOffset) : 0,
+        columnIndex: Number(item?.columnIndex)
+      }))
+      .filter(
+        (item) =>
+          Number.isInteger(item.sectionIndex) &&
+          item.sectionIndex >= 0 &&
+          Number.isInteger(item.columnIndex) &&
+          item.columnIndex >= 0 &&
+          (!includeRowOffset || Number.isInteger(item.rowOffset))
+      );
+  }
+
+  function getSectionTemplateRequirements(templateRequirements, sectionIndex) {
+    return {
+      cells: (templateRequirements?.cells || []).filter((item) => item.sectionIndex === sectionIndex),
+      headers: (templateRequirements?.headers || []).filter((item) => item.sectionIndex === sectionIndex)
+    };
+  }
+
+  function validateSectionRows({ headers, rows, rowOffsets, requirements }) {
+    const sectionLike = {
+      headers,
+      rows
+    };
+    const problems = [];
+
+    rowOffsets.forEach((offset) => {
+      const row = rows[String(offset)];
+      if (!row) {
+        problems.push(`缺少 r${offset}`);
+        return;
+      }
+
+      const dataCells = getTemplateCells(sectionLike, String(offset));
+      if (dataCells.filter(isValidDataCell).length < 2) {
+        problems.push(`r${offset} 行数据无效`);
+      }
+    });
+
+    (requirements?.headers || []).forEach((requirement) => {
+      const value = getTemplateHeaders(sectionLike)[requirement.columnIndex];
+      if (!isValidHeaderCell(value)) {
+        problems.push(`h${requirement.columnIndex + 1} 无效`);
+      }
+    });
+
+    (requirements?.cells || []).forEach((requirement) => {
+      const value = getTemplateCells(sectionLike, String(requirement.rowOffset))[requirement.columnIndex];
+      if (!isValidDataCell(value)) {
+        problems.push(`r${requirement.rowOffset},c${requirement.columnIndex + 1} 无效`);
+      }
+    });
+
+    return {
+      ok: problems.length === 0,
+      error: problems.join("；")
+    };
+  }
+
+  function isValidHeaderCell(value) {
+    return Boolean(cleanText(value));
+  }
+
+  function isValidDataCell(value) {
+    return !isReplaceableCellText(value);
+  }
+
+  function getTemplateHeaders(section) {
+    const headers = Array.isArray(section?.headers) ? section.headers : [];
+    return headers.slice(getLeadingDimensionColumnCount(section));
+  }
+
+  function getTemplateCells(section, rowOffset) {
+    const cells = Array.isArray(section?.rows?.[rowOffset]?.cells) ? section.rows[rowOffset].cells : [];
+    return cells.slice(getLeadingDimensionColumnCount(section));
+  }
+
+  function getLeadingDimensionColumnCount(section) {
+    const headers = Array.isArray(section?.headers) ? section.headers : [];
+    const firstHeader = cleanText(headers[0]);
+    if (DATE_HEADER_PATTERN.test(firstHeader)) {
+      return 1;
+    }
+
+    const rows = Object.values(section?.rows || {});
+    if (rows.some((row) => DATE_CELL_PATTERN.test(cleanText(row?.cells?.[0])))) {
+      return 1;
+    }
+
+    return 0;
   }
 
   function findProjectCode() {
@@ -228,9 +998,25 @@
   }
 
   function parseSection(section, models, context) {
-    const candidates = rankModelsForSection(models, section.title);
+    const sectionContext = context.sectionContext || {};
+    const candidates = collectSectionModels(models, sectionContext);
     const debugPrefix = `[${section.title}]`;
     context.log(`${debugPrefix} 候选表格 ${candidates.length} 个`);
+    const panelState = inspectSectionPanelState(sectionContext);
+
+    if (panelState.status !== "ready") {
+      return createSectionResult({
+        section,
+        status: panelState.status,
+        panelLoaded: false,
+        tableIndex: -1,
+        headers: [],
+        rows: {},
+        error: panelState.error
+      });
+    }
+
+    const matches = [];
 
     for (const model of candidates) {
       const rows = {};
@@ -245,6 +1031,8 @@
             dateText: target.dateText,
             label: target.label,
             rowText: row.text,
+            top: row.top,
+            rowIndex: row.rowIndex,
             cells: row.cells
           };
         } else {
@@ -256,22 +1044,50 @@
         continue;
       }
 
-      context.log(`${debugPrefix} 命中表格 #${model.index}`, {
+      const validation = validateSectionRows({
+        section,
         headers: model.headers,
-        rows
+        rows,
+        rowOffsets: context.rowOffsets,
+        requirements: context.sectionRequirements
       });
 
+      matches.push({
+        model,
+        rows,
+        missingOffsets,
+        validation,
+        score: scoreSectionMatch(model, rows, missingOffsets, validation)
+      });
+    }
+
+    if (matches.length) {
+      matches.sort((a, b) => b.score - a.score);
+      const bestMatch = matches[0];
+
+      context.log(`${debugPrefix} 命中表格 #${bestMatch.model.index}`, {
+        headers: bestMatch.model.headers,
+        rows: bestMatch.rows,
+        validation: bestMatch.validation
+      });
+
+      const status = bestMatch.validation.ok
+        ? "ready"
+        : bestMatch.missingOffsets.length
+          ? "missing-row"
+          : "invalid-row";
+
       return {
-        ok: missingOffsets.length === 0,
+        ok: bestMatch.validation.ok,
         key: section.key,
         index: section.index,
         title: section.title,
-        tableIndex: model.index,
-        headers: model.headers,
-        rows,
-        error: missingOffsets.length
-          ? `未找到行：${missingOffsets.map((offset) => `r${offset}`).join("、")}`
-          : ""
+        status,
+        panelLoaded: true,
+        tableIndex: bestMatch.model.index,
+        headers: bestMatch.model.headers,
+        rows: bestMatch.rows,
+        error: bestMatch.validation.error
       };
     }
 
@@ -283,16 +1099,51 @@
     }));
 
     context.log(`${debugPrefix} 未找到目标日期行`, fallback);
+    return createSectionResult({
+      section,
+      status: "missing-row",
+      panelLoaded: true,
+      tableIndex: -1,
+      headers: [],
+      rows: {},
+      error: `未找到配置目标行：${context.rowOffsets.map((offset) => `r${offset}`).join("、")}`
+    });
+  }
+
+  function createSectionResult({ section, status, panelLoaded, tableIndex, headers, rows, error }) {
     return {
       ok: false,
       key: section.key,
       index: section.index,
       title: section.title,
-      tableIndex: -1,
-      headers: [],
-      rows: {},
-      error: `未找到配置目标行：${context.rowOffsets.map((offset) => `r${offset}`).join("、")}`
+      status,
+      panelLoaded,
+      tableIndex,
+      headers,
+      rows,
+      error
     };
+  }
+
+  function scoreSectionMatch(model, rows, missingOffsets, validation) {
+    const headerCount = Array.isArray(model.headers) ? model.headers.filter(Boolean).length : 0;
+    const cells = Object.values(rows).flatMap((row) => row.cells || []);
+    const realCellCount = cells.filter((cell) => cell && !isPlaceholderCellText(cell)).length;
+    const placeholderCount = cells.filter(isPlaceholderCellText).length;
+    const rowCoverage = Object.values(rows).reduce((sum, row) => {
+      const cellCount = Array.isArray(row.cells) ? row.cells.length : 0;
+      return sum + Math.min(cellCount, headerCount || cellCount);
+    }, 0);
+
+    return (
+      (validation?.ok ? 2000 : 0) +
+      (missingOffsets.length ? 0 : 1000) +
+      headerCount * 20 +
+      realCellCount * 4 +
+      rowCoverage * 2 -
+      placeholderCount * 15 -
+      missingOffsets.length * 100
+    );
   }
 
   function collectTableModels() {
@@ -301,6 +1152,7 @@
       ".ant-table",
       ".el-table",
       ".vxe-table",
+      ".vxe-table--main-wrapper",
       ".arco-table",
       ".semi-table",
       "[role='table']",
@@ -326,7 +1178,7 @@
     const bodyRows = collectBodyRows(root, headerRows);
     const headerInfos = buildHeaderInfos(headerRows);
     const headers = normalizeHeaders(buildHeaders(headerRows), headerInfos);
-    const rows = buildBodyRowModels(bodyRows);
+    const rows = buildBodyRowModels(bodyRows, headers, headerInfos);
 
     return {
       index,
@@ -337,7 +1189,7 @@
     };
   }
 
-  function buildBodyRowModels(bodyRows) {
+  function buildBodyRowModels(bodyRows, headers, headerInfos) {
     const rowGroups = [];
 
     bodyRows.forEach((rowNode) => {
@@ -370,11 +1222,11 @@
 
     rowGroups
       .sort((a, b) => a.top - b.top)
-      .forEach((group) => {
+      .forEach((group, rowIndex) => {
         const cellInfos = dedupeCellInfos(group.parts.flatMap((part) => part.cells)).sort(
           (a, b) => a.left - b.left
         );
-        const cells = cellInfos.map((cell) => cell.text);
+        const cells = alignCellsToHeaders(cellInfos, headers, headerInfos);
         const rowText = cells.join(" | ");
         if (seen.has(rowText)) {
           return;
@@ -382,6 +1234,8 @@
         seen.add(rowText);
         rows.push({
           node: group.parts[0].node,
+          top: group.top,
+          rowIndex,
           cellInfos,
           cells,
           text: rowText
@@ -389,6 +1243,71 @@
       });
 
     return rows;
+  }
+
+  function alignCellsToHeaders(cellInfos, headers, headerInfos) {
+    const rawCells = cellInfos.map((cell) => cell.text);
+    const headerColumns = getHeaderColumns(headers, headerInfos);
+    if (!headerColumns.length || rawCells.length <= headerColumns.length) {
+      return rawCells;
+    }
+
+    const usedIndexes = new Set();
+    const aligned = headerColumns.map((header) => {
+      const candidates = cellInfos
+        .map((cell, index) => ({
+          cell,
+          index,
+          distance: Math.abs(cell.centerX - header.centerX)
+        }))
+        .filter((candidate) => !usedIndexes.has(candidate.index))
+        .sort((a, b) => a.distance - b.distance);
+
+      const tolerance = Math.max(40, header.width * 0.9);
+      const nearCandidates = candidates.filter((candidate) => candidate.distance <= tolerance);
+      const best =
+        nearCandidates.find((candidate) => !isPlaceholderCellText(candidate.cell.text)) ||
+        nearCandidates[0];
+
+      if (!best) {
+        return "";
+      }
+
+      usedIndexes.add(best.index);
+      return best.cell.text;
+    });
+
+    const filledCount = aligned.filter(Boolean).length;
+    return filledCount >= Math.min(headerColumns.length, rawCells.length) - 1 ? aligned : rawCells;
+  }
+
+  function isPlaceholderCellText(value) {
+    return /^[-–—\s]+$/.test(String(value || ""));
+  }
+
+  function isReplaceableCellText(value) {
+    return !cleanText(value) || isPlaceholderCellText(value);
+  }
+
+  function getHeaderColumns(headers, headerInfos) {
+    if (!Array.isArray(headers) || !headers.length || !Array.isArray(headerInfos) || !headerInfos.length) {
+      return [];
+    }
+
+    const uniqueHeaderInfos = dedupeHeaderInfos(headerInfos).sort((a, b) => a.left - b.left);
+    if (uniqueHeaderInfos.length < headers.filter(Boolean).length) {
+      return [];
+    }
+
+    return headers.map((header, index) => {
+      const headerInfo = uniqueHeaderInfos[index];
+      return {
+        text: header || headerInfo?.text || "",
+        left: headerInfo?.left ?? 0,
+        width: headerInfo?.width || 80,
+        centerX: headerInfo?.centerX ?? 0
+      };
+    });
   }
 
   function collectHeaderRows(root) {
@@ -535,27 +1454,8 @@
       .map((header) => header.text);
   }
 
-  function rankModelsForSection(models, title) {
-    const titleNodes = findTitleNodes(title);
-    const scored = models.map((model) => ({
-      model,
-      score: scoreModelForTitle(model, title, titleNodes)
-    }));
-
-    const direct = scored
-      .filter((item) => item.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .map((item) => item.model);
-
-    const fallback = scored
-      .filter((item) => item.score <= 0)
-      .map((item) => item.model);
-
-    return [...direct, ...fallback];
-  }
-
   function findTitleNodes(title) {
-    return Array.from(
+    const candidates = Array.from(
       document.querySelectorAll(
         "h1,h2,h3,h4,h5,h6,header,section,article,div,span,p,.ant-card-head-title,.el-card__header"
       )
@@ -566,35 +1466,13 @@
       const text = cleanText(getVisibleText(node));
       return text.includes(title) && text.length <= 220;
     });
-  }
 
-  function scoreModelForTitle(model, title, titleNodes) {
-    let score = 0;
-    const rootRect = model.root.getBoundingClientRect();
-    const rootText = cleanText(getVisibleText(model.root));
+    const precise = candidates.filter((node) => {
+      const text = cleanText(getVisibleText(node));
+      return text === title || (text.startsWith(title) && text.length <= title.length + 20);
+    });
 
-    if (rootText.includes(title)) {
-      score += 20;
-    }
-
-    for (const titleNode of titleNodes) {
-      let ancestor = titleNode;
-      for (let depth = 0; depth < 8 && ancestor && ancestor !== document.body; depth += 1) {
-        if (ancestor.contains(model.root)) {
-          score += Math.max(12, 80 - depth * 8);
-          break;
-        }
-        ancestor = ancestor.parentElement;
-      }
-
-      const titleRect = titleNode.getBoundingClientRect();
-      const distance = rootRect.top - titleRect.top;
-      if (distance > -40 && distance < 1200) {
-        score += Math.max(1, 45 - distance / 24);
-      }
-    }
-
-    return score;
+    return precise.length ? precise : candidates;
   }
 
   function findTargetRow(model, targetDateLabel, targetDateText) {

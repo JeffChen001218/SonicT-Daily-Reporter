@@ -20,8 +20,11 @@ const DEFAULT_PARSE_SECTIONS = [
 const LEGACY_DEFAULT_OUTPUT_TEMPLATE = `- [code]
 \t- [t1]解析结果是:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
 \t- [t2]解析结果是:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，[t2,h3] [t2,r-1,c3]，[t2,h4] [t2,r-1,c4]`;
-const DEFAULT_OUTPUT_TEMPLATE = `[code]
+const PREVIOUS_DEFAULT_OUTPUT_TEMPLATE = `[code]
 消耗量级:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
+指标:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，渗透：[t2,r-1,c3]/[t2,r-1,c4]`;
+const DEFAULT_OUTPUT_TEMPLATE = `[code]
+消耗量级:[t1,r-1,c1]，毛利：[t1,r-1,c6]
 指标:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，渗透：[t2,r-1,c3]/[t2,r-1,c4]`;
 
 const reportsList = document.querySelector("#reportsList");
@@ -336,7 +339,11 @@ function normalizeReports(value) {
 
 function normalizeInitialOutputTemplate(value) {
   const template = String(value || "");
-  if (!template || template === LEGACY_DEFAULT_OUTPUT_TEMPLATE) {
+  if (
+    !template ||
+    template === LEGACY_DEFAULT_OUTPUT_TEMPLATE ||
+    template === PREVIOUS_DEFAULT_OUTPUT_TEMPLATE
+  ) {
     return DEFAULT_OUTPUT_TEMPLATE;
   }
   return template;
