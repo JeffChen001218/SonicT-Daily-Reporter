@@ -302,7 +302,8 @@ async function importOpenTbaTabs() {
   let skipped = 0;
 
   tbaTabs.forEach((tab) => {
-    const normalizedUrl = normalizeUrlForCompare(tab.url);
+    const importUrl = normalizeImportedTbaUrl(tab.url);
+    const normalizedUrl = normalizeUrlForCompare(importUrl);
     if (!normalizedUrl || existingUrls.has(normalizedUrl)) {
       skipped += 1;
       return;
@@ -311,7 +312,7 @@ async function importOpenTbaTabs() {
     existingUrls.add(normalizedUrl);
     reports.push({
       id: createId(),
-      url: tab.url
+      url: importUrl
     });
     imported += 1;
   });
@@ -358,8 +359,12 @@ function isTbaUrl(value) {
   }
 }
 
+function normalizeImportedTbaUrl(value) {
+  return normalizeLoginRedirectUrl(value);
+}
+
 function normalizeUrlForCompare(value) {
-  const trimmed = String(value || "").trim();
+  const trimmed = normalizeLoginRedirectUrl(value);
   if (!trimmed) {
     return "";
   }
@@ -371,6 +376,62 @@ function normalizeUrlForCompare(value) {
     return url.href;
   } catch (error) {
     return trimmed;
+  }
+}
+
+function normalizeLoginRedirectUrl(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const url = new URL(trimmed);
+    const redirectTarget = getLoginRedirectTargetFromHash(url.hash);
+    if (redirectTarget) {
+      const normalizedHash = normalizeRedirectHash(redirectTarget);
+      if (normalizedHash) {
+        url.hash = normalizedHash;
+      }
+    }
+    return url.href;
+  } catch (error) {
+    return trimmed;
+  }
+}
+
+function getLoginRedirectTargetFromHash(hash) {
+  const match = /^#\/login\?(.+)$/i.exec(hash || "");
+  if (!match) {
+    return "";
+  }
+
+  const params = new URLSearchParams(match[1]);
+  return params.get("redirect") || "";
+}
+
+function normalizeRedirectHash(redirectTarget) {
+  const decoded = safeDecodeURIComponent(String(redirectTarget || "").trim());
+  if (!decoded) {
+    return "";
+  }
+
+  if (decoded.startsWith("#/")) {
+    return decoded;
+  }
+
+  if (decoded.startsWith("/")) {
+    return `#${decoded}`;
+  }
+
+  return `#/${decoded}`;
+}
+
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch (error) {
+    return value;
   }
 }
 
