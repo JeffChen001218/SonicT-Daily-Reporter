@@ -10,11 +10,26 @@ const DEFAULT_CREDENTIALS = {
   password: "tba@Jeff666"
 };
 
+const DEFAULT_PARSE_SECTIONS = [
+  {
+    id: "section-business",
+    title: "经营数据"
+  },
+  {
+    id: "section-core",
+    title: "核心指标"
+  }
+];
+
+const DEFAULT_OUTPUT_TEMPLATE = `- [code]
+\t- [t1]解析结果是:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
+\t- [t2]解析结果是:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，[t2,h3] [t2,r-1,c3]，[t2,h4] [t2,r-1,c4]`;
+
 const CONTENT_SCRIPT_FILE = "content.js";
 const TAB_LOAD_TIMEOUT_MS = 60000;
 const SNIFF_TIMEOUT_MS = 95000;
-const CONTROL_WINDOW_WIDTH = 560;
-const CONTROL_WINDOW_HEIGHT = 720;
+const CONTROL_WINDOW_WIDTH = 620;
+const CONTROL_WINDOW_HEIGHT = 820;
 
 let activeRun = {
   running: false,
@@ -56,7 +71,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function initializeDefaults() {
-  const stored = await storageGet(["reports", "credentials"]);
+  const stored = await storageGet(["reports", "credentials", "parseSections", "outputTemplate"]);
   const next = {};
 
   if (!Array.isArray(stored.reports) || !stored.reports.length) {
@@ -65,6 +80,14 @@ async function initializeDefaults() {
 
   if (!stored.credentials) {
     next.credentials = DEFAULT_CREDENTIALS;
+  }
+
+  if (!Array.isArray(stored.parseSections) || !stored.parseSections.length) {
+    next.parseSections = DEFAULT_PARSE_SECTIONS;
+  }
+
+  if (!stored.outputTemplate) {
+    next.outputTemplate = DEFAULT_OUTPUT_TEMPLATE;
   }
 
   if (Object.keys(next).length) {
@@ -125,6 +148,9 @@ async function startRun(payload) {
 
   const reports = normalizeReports(payload.reports);
   const credentials = normalizeCredentials(payload.credentials);
+  const parseSections = normalizeParseSections(payload.parseSections);
+  const outputTemplate = normalizeOutputTemplate(payload.outputTemplate);
+  const rowOffsets = collectRowOffsetsFromTemplate(outputTemplate);
 
   activeRun = {
     running: true,
@@ -145,13 +171,15 @@ async function startRun(payload) {
   await storageSet({
     reports,
     credentials,
+    parseSections,
+    outputTemplate,
     runLog: "",
     runtimeState: publicRuntimeState()
   });
 
   await appendLog(`任务开始，共 ${reports.length} 个网址`);
 
-  void runQueue(reports, credentials).catch(async (error) => {
+  void runQueue(reports, credentials, parseSections, outputTemplate, rowOffsets).catch(async (error) => {
     await appendLog(`任务异常中断：${messageFromError(error)}`);
     activeRun.running = false;
     activeRun.currentTabId = null;
@@ -186,7 +214,7 @@ async function getState() {
   };
 }
 
-async function runQueue(reports, credentials) {
+async function runQueue(reports, credentials, parseSections, outputTemplate, rowOffsets) {
   if (!reports.length) {
     await appendLog("没有可执行的网址");
   }
@@ -217,22 +245,24 @@ async function runQueue(reports, credentials) {
       const response = await runSniffOnTab(tab.id, {
         report,
         credentials,
+        parseSections,
+        rowOffsets,
         timeoutMs: SNIFF_TIMEOUT_MS
       });
 
       if (response?.ok) {
         const isComplete = !hasParseProblem(response.result);
         await setReportStatus(report.id, isComplete ? "完成" : "完成(有缺失)", "解析完成");
-        await appendLog(formatReportResult(report, response.result, index));
+        await appendOutputBlock(formatReportResult(response.result, index, outputTemplate));
       } else {
         const errorText = response?.error || "页面脚本未返回结果";
         await setReportStatus(report.id, "失败", errorText);
-        await appendLog(formatFailure(report, errorText, response?.result, index));
+        await appendOutputBlock(formatFailure(errorText, response?.result, index, outputTemplate));
       }
     } catch (error) {
       const errorText = messageFromError(error);
       await setReportStatus(report.id, "失败", errorText);
-      await appendLog(formatFailure(report, errorText, null, index));
+      await appendOutputBlock(formatFailure(errorText, null, index, outputTemplate));
     } finally {
       activeRun.currentTabId = null;
     }
@@ -331,6 +361,38 @@ function normalizeCredentials(value) {
   };
 }
 
+function normalizeParseSections(value) {
+  const source = Array.isArray(value) && value.length ? value : DEFAULT_PARSE_SECTIONS;
+  return source
+    .map((section, index) => ({
+      id: section.id || `section-${index + 1}`,
+      title: String(section.title || section.name || "").trim()
+    }))
+    .filter((section) => section.title);
+}
+
+function normalizeOutputTemplate(value) {
+  const template = String(value || "").trimEnd();
+  return template || DEFAULT_OUTPUT_TEMPLATE;
+}
+
+function collectRowOffsetsFromTemplate(template) {
+  const offsets = new Set();
+  const pattern = /\[t\d+,r([+-]?\d+),c\d+\]/gi;
+  let match = pattern.exec(template);
+
+  while (match) {
+    offsets.add(Number(match[1]));
+    match = pattern.exec(template);
+  }
+
+  if (!offsets.size) {
+    offsets.add(-1);
+  }
+
+  return Array.from(offsets).sort((a, b) => a - b);
+}
+
 async function setReportStatus(reportId, status, detail = "") {
   activeRun.statuses[reportId] = {
     status,
@@ -367,78 +429,129 @@ async function appendLog(line) {
   broadcastUpdate(publicRuntimeState(), activeRun.log);
 }
 
+async function appendOutputBlock(block) {
+  if (typeof activeRun.log !== "string") {
+    const stored = await storageGet("runLog");
+    activeRun.log = stored.runLog || "";
+  }
+
+  const normalizedBlock = String(block || "").trimEnd();
+  if (!normalizedBlock) {
+    return;
+  }
+
+  if (activeRun.log && !activeRun.log.endsWith("\n")) {
+    activeRun.log += "\n";
+  }
+  activeRun.log += `${normalizedBlock}\n`;
+  await storageSet({
+    runLog: activeRun.log
+  });
+  broadcastUpdate(publicRuntimeState(), activeRun.log);
+}
+
 function formatContentLog(tab, payload) {
   const label = tab?.url ? shortUrl(tab.url) : "页面";
   return `${label}：${payload?.text || ""}`;
 }
 
-function formatReportResult(report, result, index) {
-  const lines = [
-    "",
-    `========== [${index + 1}] ${report.url} ==========`,
-    `页面标题：${result?.title || "未知"}`,
-    `目标日期：${result?.targetDateLabel || "未知"}`
-  ];
-
-  const business = result?.groups?.business;
-  const core = result?.groups?.core;
-
-  lines.push(formatGroup("经营数据", business, ["消耗", "毛利"]));
-  lines.push(formatGroup("核心指标", core, ["d0", "PV", "渗透率-TT", "渗透率-GG"]));
+function formatReportResult(result, index, outputTemplate) {
+  const lines = [renderOutputTemplate(outputTemplate, result, index + 1)];
 
   if (hasParseProblem(result)) {
     lines.push("调试状态：");
+    lines.push(...formatSectionProblemLines(result));
     lines.push(...formatDebugLines(result?.debug || []));
   }
 
   return lines.join("\n");
 }
 
-function formatFailure(report, errorText, result, index) {
-  const lines = [
-    "",
-    `========== [${index + 1}] ${report.url} ==========`,
-    `解析失败：${errorText}`
-  ];
+function formatFailure(errorText, result, index, outputTemplate) {
+  const lines = [];
 
+  if (result) {
+    lines.push(renderOutputTemplate(outputTemplate, result, index + 1));
+  } else {
+    lines.push(`- ${index + 1}`);
+  }
+
+  lines.push("调试状态：");
+  lines.push(`- 解析失败：${errorText}`);
+  lines.push(...formatSectionProblemLines(result));
   if (result?.debug?.length) {
-    lines.push("调试状态：");
     lines.push(...formatDebugLines(result.debug));
   }
 
   return lines.join("\n");
 }
 
-function formatGroup(title, group, fields) {
-  if (!group) {
-    return `${title}：未返回`;
+function renderOutputTemplate(template, result, code) {
+  return normalizeOutputTemplate(template).replace(/\[([^\]]+)\]/g, (_whole, token) =>
+    resolvePlaceholder(token.trim(), result, code)
+  );
+}
+
+function resolvePlaceholder(token, result, code) {
+  if (token === "code") {
+    return String(code);
   }
 
-  const values = fields.map((field) => {
-    const item = group.fields?.[field];
-    return `${field}=${item?.value || "未找到"}`;
-  });
+  let match = /^t(\d+)$/i.exec(token);
+  if (match) {
+    return getSection(result, Number(match[1]))?.title || "";
+  }
 
-  const rowInfo = group.rowText ? `；行=${compactText(group.rowText, 120)}` : "";
-  const suffix = group.ok ? "" : `；状态=${group.error || "未完整解析"}`;
-  return `${title}：${values.join("，")}${suffix}${rowInfo}`;
+  match = /^t(\d+),h(\d+)$/i.exec(token);
+  if (match) {
+    const section = getSection(result, Number(match[1]));
+    const headerIndex = Number(match[2]) - 1;
+    return section?.headers?.[headerIndex] || "";
+  }
+
+  match = /^t(\d+),r([+-]?\d+),c(\d+)$/i.exec(token);
+  if (match) {
+    const section = getSection(result, Number(match[1]));
+    const rowOffset = String(Number(match[2]));
+    const columnIndex = Number(match[3]) - 1;
+    return section?.rows?.[rowOffset]?.cells?.[columnIndex] || "";
+  }
+
+  return "";
+}
+
+function getSection(result, sectionNumber) {
+  return result?.sections?.[sectionNumber - 1] || null;
 }
 
 function hasParseProblem(result) {
-  if (!result?.groups) {
+  if (!Array.isArray(result?.sections) || !result.sections.length) {
     return true;
   }
 
-  return Object.values(result.groups).some((group) => !group?.ok);
+  return result.sections.some((section) => !section?.ok);
+}
+
+function formatSectionProblemLines(result) {
+  if (!Array.isArray(result?.sections)) {
+    return [];
+  }
+
+  return result.sections
+    .filter((section) => !section.ok)
+    .map((section) => {
+      const title = section.title || section.key || "未知板块";
+      return `- ${title}：${section.error || "未完整解析"}`;
+    });
 }
 
 function formatDebugLines(debug) {
   const limited = debug.slice(-80);
   return limited.map((entry) => {
     if (typeof entry === "string") {
-      return `- ${entry}`;
+      return `- ${compactText(entry, 500)}`;
     }
-    return `- ${entry.text || JSON.stringify(entry)}`;
+    return `- ${compactText(entry.text || JSON.stringify(entry), 500)}`;
   });
 }
 

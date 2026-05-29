@@ -22,7 +22,7 @@
 
 body {
   width: 100vw;
-  min-width: 520px;
+  min-width: 560px;
   min-height: 100vh;
   margin: 0;
   overflow: hidden;
@@ -65,6 +65,7 @@ button:disabled {
   gap: 12px;
   height: 100vh;
   min-height: 650px;
+  overflow: auto;
   padding: 14px;
 }
 
@@ -158,20 +159,38 @@ h2 {
   margin-bottom: 10px;
 }
 
-.reports-list {
+.reports-list,
+.parse-sections-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 180px;
+  max-height: 150px;
   overflow: auto;
   padding-right: 2px;
 }
 
-.report-row {
+.report-row,
+.section-row {
   display: grid;
   grid-template-columns: 1fr auto auto;
   align-items: center;
   gap: 8px;
+}
+
+.section-row {
+  grid-template-columns: 46px 1fr auto;
+}
+
+.section-code {
+  display: inline-flex;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+  color: var(--muted);
+  font-weight: 700;
 }
 
 input,
@@ -246,7 +265,7 @@ label span {
 
 .output-section {
   display: flex;
-  min-height: 0;
+  min-height: 260px;
   flex: 1;
   flex-direction: column;
 }
@@ -259,6 +278,18 @@ textarea {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   font-size: 12px;
   line-height: 1.55;
+}
+
+.template-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.template-area {
+  min-height: 110px;
+  flex: none;
+  resize: vertical;
 }
 
 .empty-state {

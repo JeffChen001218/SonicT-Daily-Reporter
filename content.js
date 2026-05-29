@@ -4,20 +4,9 @@
   }
   window.__SONIC_DAILY_CONTENT_INSTALLED__ = true;
 
-  const TARGET_SECTIONS = [
-    {
-      key: "business",
-      title: "经营数据",
-      fields: ["消耗", "毛利"]
-    },
-    {
-      key: "core",
-      title: "核心指标",
-      fields: ["d0", "PV", "渗透率-TT", "渗透率-GG"]
-    }
-  ];
   const WEEKDAYS = ["日", "一", "二", "三", "四", "五", "六"];
   const DEFAULT_TIMEOUT_MS = 90000;
+  const DEFAULT_ROW_OFFSETS = [-1];
 
   let cancelRequested = false;
 
@@ -55,9 +44,23 @@
 
   async function runSniff(payload) {
     const debug = [];
-    const targetDate = getYesterday();
-    const targetDateText = formatDate(targetDate);
-    const targetDateLabel = `${targetDateText}(${WEEKDAYS[targetDate.getDay()]})`;
+    const parseSections = normalizeParseSections(payload.parseSections);
+    const rowOffsets = normalizeRowOffsets(payload.rowOffsets);
+    const rowTargets = Object.fromEntries(
+      rowOffsets.map((offset) => {
+        const date = getDateByOffset(offset);
+        const dateText = formatDate(date);
+        return [
+          String(offset),
+          {
+            offset,
+            dateText,
+            label: `${dateText}(${WEEKDAYS[date.getDay()]})`
+          }
+        ];
+      })
+    );
+    const primaryTarget = rowTargets["-1"] || rowTargets[String(rowOffsets[0])];
     const timeoutMs = Number(payload.timeoutMs || DEFAULT_TIMEOUT_MS);
 
     const log = (text, extra) => {
@@ -68,18 +71,19 @@
       sendContentLog(line);
     };
 
-    log(`开始页面嗅探，目标日期 ${targetDateLabel}`);
+    log(`开始页面嗅探，解析板块 ${parseSections.map((section) => section.title).join("、") || "未配置"}`);
+    log(`目标行 ${Object.values(rowTargets).map((target) => `r${target.offset}:${target.label}`).join("、")}`);
     await waitForDomReady();
 
     const loginResult = await maybeLogin(payload.credentials || {}, log);
     if (loginResult.attempted) {
       log(loginResult.clicked ? "已尝试自动登录，等待页面进入报表" : "已填充登录信息，未找到明确登录按钮");
-      await waitForReportReady(targetDateText, timeoutMs, log).catch((error) => {
+      await waitForReportReady(parseSections, Object.values(rowTargets), timeoutMs, log).catch((error) => {
         log(`登录后等待报表超时：${messageFromError(error)}`);
       });
     }
 
-    await waitForReportReady(targetDateText, timeoutMs, log).catch((error) => {
+    await waitForReportReady(parseSections, Object.values(rowTargets), timeoutMs, log).catch((error) => {
       log(`等待报表超时：${messageFromError(error)}`);
     });
 
@@ -88,23 +92,31 @@
     const models = collectTableModels();
     log(`发现表格候选 ${models.length} 个`);
 
-    const groups = {};
-    for (const section of TARGET_SECTIONS) {
-      groups[section.key] = parseSection(section, models, {
-        targetDateText,
-        targetDateLabel,
-        log
-      });
-    }
+    const sections = parseSections.map((section, index) =>
+      parseSection(
+        {
+          ...section,
+          key: `t${index + 1}`,
+          index: index + 1
+        },
+        models,
+        {
+          rowTargets,
+          rowOffsets,
+          log
+        }
+      )
+    );
 
     return {
-      ok: Object.values(groups).some((group) => group.ok),
+      ok: sections.some((section) => section.ok),
       result: {
         url: location.href,
         title: document.title,
-        targetDateText,
-        targetDateLabel,
-        groups,
+        targetDateText: primaryTarget?.dateText || "",
+        targetDateLabel: primaryTarget?.label || "",
+        rowTargets,
+        sections,
         debug
       }
     };
@@ -164,19 +176,20 @@
     };
   }
 
-  async function waitForReportReady(targetDateText, timeoutMs, log) {
+  async function waitForReportReady(parseSections, rowTargets, timeoutMs, log) {
     await waitForCondition(
       () => {
         throwIfStopped();
         const pageText = getVisibleText(document.body);
-        const hasSection = TARGET_SECTIONS.some((section) => pageText.includes(section.title));
-        const hasDate = pageText.includes(targetDateText);
+        const hasSection =
+          !parseSections.length || parseSections.some((section) => pageText.includes(section.title));
+        const hasDate = rowTargets.some((target) => pageText.includes(target.dateText));
         return hasSection && hasDate;
       },
       timeoutMs,
       800
     );
-    log("页面中已发现目标日期和目标板块文字");
+    log("页面中已发现目标日期和配置板块文字");
   }
 
   function parseSection(section, models, context) {
@@ -185,34 +198,45 @@
     context.log(`${debugPrefix} 候选表格 ${candidates.length} 个`);
 
     for (const model of candidates) {
-      const row = findTargetRow(model, context.targetDateLabel, context.targetDateText);
-      if (!row) {
-        continue;
+      const rows = {};
+      const missingOffsets = [];
+
+      for (const offset of context.rowOffsets) {
+        const target = context.rowTargets[String(offset)];
+        const row = findTargetRow(model, target.label, target.dateText);
+        if (row) {
+          rows[String(offset)] = {
+            offset,
+            dateText: target.dateText,
+            label: target.label,
+            rowText: row.text,
+            cells: row.cells
+          };
+        } else {
+          missingOffsets.push(offset);
+        }
       }
 
-      const fields = {};
-      const missing = [];
-      for (const field of section.fields) {
-        const match = findFieldValue(model, row, field);
-        fields[field] = match;
-        if (!match.value) {
-          missing.push(field);
-        }
+      if (!Object.keys(rows).length) {
+        continue;
       }
 
       context.log(`${debugPrefix} 命中表格 #${model.index}`, {
         headers: model.headers,
-        row: row.cells
+        rows
       });
 
       return {
-        ok: missing.length === 0,
+        ok: missingOffsets.length === 0,
+        key: section.key,
+        index: section.index,
         title: section.title,
         tableIndex: model.index,
-        rowText: row.text,
         headers: model.headers,
-        fields,
-        error: missing.length ? `未找到列：${missing.join("、")}` : ""
+        rows,
+        error: missingOffsets.length
+          ? `未找到行：${missingOffsets.map((offset) => `r${offset}`).join("、")}`
+          : ""
       };
     }
 
@@ -226,21 +250,13 @@
     context.log(`${debugPrefix} 未找到目标日期行`, fallback);
     return {
       ok: false,
+      key: section.key,
+      index: section.index,
       title: section.title,
       tableIndex: -1,
-      rowText: "",
       headers: [],
-      fields: Object.fromEntries(
-        section.fields.map((field) => [
-          field,
-          {
-            value: "",
-            columnIndex: -1,
-            header: ""
-          }
-        ])
-      ),
-      error: `未找到 ${context.targetDateLabel} 所在行`
+      rows: {},
+      error: `未找到配置目标行：${context.rowOffsets.map((offset) => `r${offset}`).join("、")}`
     };
   }
 
@@ -273,8 +289,8 @@
   function buildTableModel(root, index) {
     const headerRows = collectHeaderRows(root);
     const bodyRows = collectBodyRows(root, headerRows);
-    const headers = buildHeaders(headerRows);
     const headerInfos = buildHeaderInfos(headerRows);
+    const headers = normalizeHeaders(buildHeaders(headerRows), headerInfos);
     const rows = buildBodyRowModels(bodyRows);
 
     return {
@@ -400,26 +416,23 @@
       return [];
     }
 
+    const headerRowModels = buildHeaderRowModels(headerRows);
     const grid = [];
-    headerRows.forEach((row, rowIndex) => {
+    headerRowModels.forEach((cells, rowIndex) => {
       grid[rowIndex] ||= [];
       let columnIndex = 0;
-      collectCells(row).forEach((cell) => {
+      cells.forEach((cell) => {
         while (grid[rowIndex][columnIndex]) {
           columnIndex += 1;
         }
 
-        const text = cleanText(getVisibleText(cell));
-        const colSpan = Number(cell.getAttribute("colspan") || cell.colSpan || 1);
-        const rowSpan = Number(cell.getAttribute("rowspan") || cell.rowSpan || 1);
-
-        for (let r = 0; r < rowSpan; r += 1) {
-          for (let c = 0; c < colSpan; c += 1) {
+        for (let r = 0; r < cell.rowSpan; r += 1) {
+          for (let c = 0; c < cell.colSpan; c += 1) {
             grid[rowIndex + r] ||= [];
-            grid[rowIndex + r][columnIndex + c] = text;
+            grid[rowIndex + r][columnIndex + c] = cell.text;
           }
         }
-        columnIndex += colSpan;
+        columnIndex += cell.colSpan;
       });
     });
 
@@ -440,6 +453,28 @@
     return headers;
   }
 
+  function buildHeaderRowModels(headerRows) {
+    const groups = [];
+
+    headerRows.forEach((row) => {
+      const rect = row.getBoundingClientRect();
+      let group = groups.find((item) => Math.abs(item.top - rect.top) <= 3);
+      if (!group) {
+        group = {
+          top: rect.top,
+          cells: []
+        };
+        groups.push(group);
+      }
+
+      group.cells.push(...collectCells(row).map(headerCellToInfo).filter((cell) => cell.text));
+    });
+
+    return groups
+      .sort((a, b) => a.top - b.top)
+      .map((group) => dedupeHeaderInfos(group.cells).sort((a, b) => a.left - b.left));
+  }
+
   function buildHeaderInfos(headerRows) {
     return dedupeCellInfos(
       headerRows.flatMap((row) => collectCells(row).map(cellToInfo).filter((cell) => cell.text))
@@ -449,6 +484,20 @@
       }
       return a.left - b.left;
     });
+  }
+
+  function normalizeHeaders(headers, headerInfos) {
+    const usefulHeaders = headers.filter(Boolean);
+    if (usefulHeaders.length) {
+      return headers;
+    }
+
+    return headerInfos
+      .filter((header, index, source) => {
+        const sameTextBefore = source.findIndex((item) => item.text === header.text);
+        return sameTextBefore === index;
+      })
+      .map((header) => header.text);
   }
 
   function rankModelsForSection(models, title) {
@@ -516,114 +565,6 @@
   function findTargetRow(model, targetDateLabel, targetDateText) {
     return model.rows.find((row) => row.text.includes(targetDateLabel)) ||
       model.rows.find((row) => row.text.includes(targetDateText));
-  }
-
-  function findFieldValue(model, row, field) {
-    const fieldIndex = findHeaderIndex(model.headers, field);
-    if (fieldIndex >= 0) {
-      const value = row.cells[fieldIndex] || "";
-      if (value) {
-        return {
-          value,
-          columnIndex: fieldIndex,
-          header: model.headers[fieldIndex] || ""
-        };
-      }
-    }
-
-    const spatialMatch = findFieldValueByPosition(model, row, field);
-    if (spatialMatch.value) {
-      return spatialMatch;
-    }
-
-    if (fieldIndex >= 0) {
-      return {
-        value: "",
-        columnIndex: fieldIndex,
-        header: model.headers[fieldIndex] || ""
-      };
-    }
-
-    return {
-      value: "",
-      columnIndex: -1,
-      header: ""
-    };
-  }
-
-  function findFieldValueByPosition(model, row, field) {
-    const matchedHeaders = model.headerInfos
-      .filter((header) => headerMatchesField(header.text, field))
-      .sort((a, b) => Math.abs(normalizeHeader(a.text).length - normalizeHeader(field).length) -
-        Math.abs(normalizeHeader(b.text).length - normalizeHeader(field).length));
-
-    for (const header of matchedHeaders) {
-      const nearestCell = row.cellInfos
-        .map((cell) => ({
-          cell,
-          distance: Math.abs(cell.centerX - header.centerX)
-        }))
-        .sort((a, b) => a.distance - b.distance)[0];
-
-      if (nearestCell && nearestCell.distance <= Math.max(80, header.width * 0.9)) {
-        return {
-          value: nearestCell.cell.text,
-          columnIndex: -1,
-          header: header.text
-        };
-      }
-    }
-
-    return {
-      value: "",
-      columnIndex: -1,
-      header: ""
-    };
-  }
-
-  function findHeaderIndex(headers, field) {
-    const normalizedField = normalizeHeader(field);
-    const exactIndex = headers.findIndex((header) => normalizeHeader(header) === normalizedField);
-    if (exactIndex >= 0) {
-      return exactIndex;
-    }
-
-    return headers.findIndex((header) => headerMatchesField(header, field));
-  }
-
-  function headerMatchesField(header, field) {
-    const normalizedHeader = normalizeHeader(header);
-    const normalizedField = normalizeHeader(field);
-
-    if (!normalizedHeader) {
-      return false;
-    }
-
-    if (field === "渗透率-TT") {
-      return normalizedHeader.includes("渗透率") && normalizedHeader.includes("tt");
-    }
-
-    if (field === "渗透率-GG") {
-      return normalizedHeader.includes("渗透率") && normalizedHeader.includes("gg");
-    }
-
-    if (field.toLowerCase() === "pv") {
-      return normalizedHeader === "pv" || normalizedHeader.includes("pv");
-    }
-
-    if (field.toLowerCase() === "d0") {
-      return normalizedHeader === "d0" || normalizedHeader.includes("d0");
-    }
-
-    return normalizedHeader.includes(normalizedField);
-  }
-
-  function normalizeHeader(value) {
-    return String(value || "")
-      .toLowerCase()
-      .replace(/\s+/g, "")
-      .replace(/[：:()（）\[\]【】_%/\\|]/g, "")
-      .replace(/[‐‑‒–—-]/g, "");
   }
 
   function findVisibleInput(type) {
@@ -724,10 +665,30 @@
     };
   }
 
+  function headerCellToInfo(cell) {
+    return {
+      ...cellToInfo(cell),
+      colSpan: Number(cell.getAttribute("colspan") || cell.colSpan || 1),
+      rowSpan: Number(cell.getAttribute("rowspan") || cell.rowSpan || 1)
+    };
+  }
+
   function dedupeCellInfos(cells) {
     const seen = new Set();
     return cells.filter((cell) => {
       const key = `${Math.round(cell.left)}:${Math.round(cell.top)}:${cell.text}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function dedupeHeaderInfos(cells) {
+    const seen = new Set();
+    return cells.filter((cell) => {
+      const key = `${Math.round(cell.left)}:${cell.text}`;
       if (seen.has(key)) {
         return false;
       }
@@ -768,9 +729,35 @@
     return Array.from(new Set(nodes));
   }
 
-  function getYesterday() {
+  function normalizeParseSections(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return value
+      .map((section, index) => ({
+        id: section.id || `section-${index + 1}`,
+        title: cleanText(section.title || section.name || "")
+      }))
+      .filter((section) => section.title);
+  }
+
+  function normalizeRowOffsets(value) {
+    const offsets = Array.isArray(value) ? value : DEFAULT_ROW_OFFSETS;
+    const normalized = Array.from(
+      new Set(
+        offsets
+          .map((offset) => Number(offset))
+          .filter((offset) => Number.isFinite(offset))
+      )
+    );
+
+    return normalized.length ? normalized : DEFAULT_ROW_OFFSETS;
+  }
+
+  function getDateByOffset(offset) {
     const date = new Date();
-    date.setDate(date.getDate() - 1);
+    date.setDate(date.getDate() + offset);
     return date;
   }
 

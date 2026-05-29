@@ -10,18 +10,37 @@ const DEFAULT_CREDENTIALS = {
   password: "tba@Jeff666"
 };
 
+const DEFAULT_PARSE_SECTIONS = [
+  {
+    id: "section-business",
+    title: "经营数据"
+  },
+  {
+    id: "section-core",
+    title: "核心指标"
+  }
+];
+
+const DEFAULT_OUTPUT_TEMPLATE = `- [code]
+\t- [t1]解析结果是:[t1,h1] [t1,r-1,c1]，[t1,h6] [t1,r-1,c6]
+\t- [t2]解析结果是:[t2,h1] [t2,r-1,c1]，[t2,h2] [t2,r-1,c2]，[t2,h3] [t2,r-1,c3]，[t2,h4] [t2,r-1,c4]`;
+
 const reportsList = document.querySelector("#reportsList");
+const parseSectionsList = document.querySelector("#parseSectionsList");
 const accountInput = document.querySelector("#accountInput");
 const passwordInput = document.querySelector("#passwordInput");
 const startBtn = document.querySelector("#startBtn");
 const stopBtn = document.querySelector("#stopBtn");
 const addReportBtn = document.querySelector("#addReportBtn");
+const addSectionBtn = document.querySelector("#addSectionBtn");
+const templateArea = document.querySelector("#templateArea");
 const outputArea = document.querySelector("#outputArea");
 const runState = document.querySelector("#runState");
 const copyBtn = document.querySelector("#copyBtn");
 const clearBtn = document.querySelector("#clearBtn");
 
 let reports = [];
+let parseSections = [];
 let runtimeState = {
   running: false,
   statuses: {}
@@ -34,11 +53,14 @@ async function init() {
   const stored = await chrome.storage.local.get([
     "reports",
     "credentials",
+    "parseSections",
+    "outputTemplate",
     "runtimeState",
     "runLog"
   ]);
 
   reports = normalizeReports(stored.reports);
+  parseSections = normalizeParseSections(stored.parseSections);
   const credentials = {
     ...DEFAULT_CREDENTIALS,
     ...(stored.credentials || {})
@@ -50,6 +72,7 @@ async function init() {
 
   accountInput.value = credentials.account || "";
   passwordInput.value = credentials.password || "";
+  templateArea.value = stored.outputTemplate || DEFAULT_OUTPUT_TEMPLATE;
   outputArea.value = stored.runLog || "";
 
   render();
@@ -67,11 +90,22 @@ function bindEvents() {
     scheduleSave();
   });
 
+  addSectionBtn.addEventListener("click", () => {
+    parseSections.push({
+      id: createId(),
+      title: ""
+    });
+    renderParseSections();
+    scheduleSave();
+  });
+
   startBtn.addEventListener("click", async () => {
     await saveConfig();
     const payload = {
       reports: reports.filter((report) => report.url.trim()),
-      credentials: collectCredentials()
+      credentials: collectCredentials(),
+      parseSections: parseSections.filter((section) => section.title.trim()),
+      outputTemplate: templateArea.value
     };
     await chrome.runtime.sendMessage({
       type: "START_RUN",
@@ -90,6 +124,8 @@ function bindEvents() {
   [accountInput, passwordInput].forEach((input) => {
     input.addEventListener("input", scheduleSave);
   });
+
+  templateArea.addEventListener("input", scheduleSave);
 
   outputArea.addEventListener("input", () => {
     chrome.storage.local.set({
@@ -116,7 +152,7 @@ function bindEvents() {
       ...runtimeState,
       ...(message.payload?.runtimeState || {})
     };
-    if (typeof message.payload?.runLog === "string") {
+    if (typeof message.payload?.runLog === "string" && document.activeElement !== outputArea) {
       outputArea.value = message.payload.runLog;
       outputArea.scrollTop = outputArea.scrollHeight;
     }
@@ -143,6 +179,7 @@ function bindEvents() {
 
 function render() {
   renderReports();
+  renderParseSections();
   runState.textContent = runtimeState.running ? "运行中" : "待命";
   startBtn.disabled = runtimeState.running;
   stopBtn.disabled = !runtimeState.running;
@@ -199,11 +236,67 @@ function renderReports() {
   });
 }
 
+function renderParseSections() {
+  parseSectionsList.textContent = "";
+
+  if (!parseSections.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "暂无解析板块";
+    parseSectionsList.append(empty);
+    return;
+  }
+
+  parseSections.forEach((section, index) => {
+    const row = document.createElement("div");
+    row.className = "section-row";
+
+    const code = document.createElement("span");
+    code.className = "section-code";
+    code.textContent = `t${index + 1}`;
+    code.title = `模版通配符前缀：t${index + 1}`;
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "板块名称，例如：经营数据";
+    input.value = section.title || "";
+    input.addEventListener("input", () => {
+      parseSections[index] = {
+        ...parseSections[index],
+        title: input.value
+      };
+      scheduleSave();
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "ghost remove-btn";
+    remove.textContent = "×";
+    remove.title = "删除";
+    remove.addEventListener("click", () => {
+      parseSections = parseSections.filter((item) => item.id !== section.id);
+      renderParseSections();
+      scheduleSave();
+    });
+
+    row.append(code, input, remove);
+    parseSectionsList.append(row);
+  });
+}
+
 function normalizeReports(value) {
   const source = Array.isArray(value) && value.length ? value : DEFAULT_REPORTS;
   return source.map((report) => ({
     id: report.id || createId(),
     url: report.url || ""
+  }));
+}
+
+function normalizeParseSections(value) {
+  const source = Array.isArray(value) && value.length ? value : DEFAULT_PARSE_SECTIONS;
+  return source.map((section) => ({
+    id: section.id || createId(),
+    title: section.title || section.name || ""
   }));
 }
 
@@ -222,7 +315,9 @@ function scheduleSave() {
 async function saveConfig() {
   await chrome.storage.local.set({
     reports,
-    credentials: collectCredentials()
+    credentials: collectCredentials(),
+    parseSections,
+    outputTemplate: templateArea.value
   });
 }
 
