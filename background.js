@@ -221,6 +221,7 @@ async function runQueue(reports, credentials, parseSections, outputTemplate, row
 
   for (let index = 0; index < reports.length; index += 1) {
     const report = reports[index];
+    let openedTabId = null;
 
     if (activeRun.shouldStop) {
       await setReportStatus(report.id, "已停止", "任务在打开该网址前停止");
@@ -235,6 +236,7 @@ async function runQueue(reports, credentials, parseSections, outputTemplate, row
         url: report.url,
         active: true
       });
+      openedTabId = tab.id;
       activeRun.currentTabId = tab.id;
       await focusTab(tab.id, tab.windowId);
 
@@ -264,6 +266,9 @@ async function runQueue(reports, credentials, parseSections, outputTemplate, row
       await setReportStatus(report.id, "失败", errorText);
       await appendOutputBlock(formatFailure(errorText, null, index, outputTemplate));
     } finally {
+      if (openedTabId) {
+        await tabsRemove(openedTabId).catch((error) => appendLog(`关闭页面失败：${messageFromError(error)}`));
+      }
       activeRun.currentTabId = null;
     }
   }
@@ -634,6 +639,10 @@ function tabsCreate(value) {
 
 function tabsUpdate(tabId, value) {
   return callbackPromise((callback) => chrome.tabs.update(tabId, value, callback));
+}
+
+function tabsRemove(tabId) {
+  return callbackPromise((callback) => chrome.tabs.remove(tabId, callback));
 }
 
 function windowsUpdate(windowId, value) {
