@@ -1,9 +1,5 @@
-const DEFAULT_REPORTS = [
-  {
-    id: "sample-ntba",
-    url: "https://ntba.gte666.com/#/dashboard/11500_132528"
-  }
-];
+const DEFAULT_REPORTS = [];
+const LEGACY_DEFAULT_REPORT_URL = "https://ntba.gte666.com/#/dashboard/11500_132528";
 
 const DEFAULT_CREDENTIALS = {
   account: "chenjianfeng",
@@ -28,8 +24,6 @@ const DEFAULT_OUTPUT_TEMPLATE = `- [code]
 const CONTENT_SCRIPT_FILE = "content.js";
 const TAB_LOAD_TIMEOUT_MS = 60000;
 const SNIFF_TIMEOUT_MS = 95000;
-const CONTROL_WINDOW_WIDTH = 620;
-const CONTROL_WINDOW_HEIGHT = 820;
 
 let activeRun = {
   running: false,
@@ -38,7 +32,6 @@ let activeRun = {
   statuses: {},
   log: ""
 };
-let controlWindowId = null;
 
 chrome.runtime.onInstalled.addListener(() => {
   initializeDefaults();
@@ -46,16 +39,6 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(() => {
   initializeDefaults();
-});
-
-chrome.action.onClicked.addListener(() => {
-  openControlWindow();
-});
-
-chrome.windows.onRemoved.addListener((windowId) => {
-  if (windowId === controlWindowId) {
-    controlWindowId = null;
-  }
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -74,7 +57,7 @@ async function initializeDefaults() {
   const stored = await storageGet(["reports", "credentials", "parseSections", "outputTemplate"]);
   const next = {};
 
-  if (!Array.isArray(stored.reports) || !stored.reports.length) {
+  if (!Array.isArray(stored.reports) || isLegacyDefaultReports(stored.reports)) {
     next.reports = DEFAULT_REPORTS;
   }
 
@@ -93,28 +76,6 @@ async function initializeDefaults() {
   if (Object.keys(next).length) {
     await storageSet(next);
   }
-}
-
-async function openControlWindow() {
-  if (controlWindowId) {
-    try {
-      await windowsUpdate(controlWindowId, {
-        focused: true
-      });
-      return;
-    } catch (error) {
-      controlWindowId = null;
-    }
-  }
-
-  const created = await windowsCreate({
-    url: chrome.runtime.getURL("popup.html"),
-    type: "popup",
-    width: CONTROL_WINDOW_WIDTH,
-    height: CONTROL_WINDOW_HEIGHT,
-    focused: true
-  });
-  controlWindowId = created.id;
 }
 
 async function handleMessage(message, sender) {
@@ -350,13 +311,41 @@ async function focusTab(tabId, windowId) {
 }
 
 function normalizeReports(value) {
-  const source = Array.isArray(value) && value.length ? value : DEFAULT_REPORTS;
+  if (isLegacyDefaultReports(value)) {
+    return [];
+  }
+
+  const source = Array.isArray(value) ? value : DEFAULT_REPORTS;
   return source
     .map((report) => ({
       id: report.id || createId(),
       url: String(report.url || "").trim()
     }))
     .filter((report) => report.url);
+}
+
+function isLegacyDefaultReports(value) {
+  return (
+    Array.isArray(value) &&
+    value.length === 1 &&
+    normalizeUrlForCompare(value[0]?.url) === normalizeUrlForCompare(LEGACY_DEFAULT_REPORT_URL)
+  );
+}
+
+function normalizeUrlForCompare(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const url = new URL(trimmed);
+    url.protocol = url.protocol.toLowerCase();
+    url.hostname = url.hostname.toLowerCase();
+    return url.href;
+  } catch (error) {
+    return trimmed;
+  }
 }
 
 function normalizeCredentials(value) {
@@ -461,7 +450,7 @@ function formatContentLog(tab, payload) {
 }
 
 function formatReportResult(result, index, outputTemplate) {
-  const lines = [renderOutputTemplate(outputTemplate, result, index + 1)];
+  const lines = [renderOutputTemplate(outputTemplate, result)];
 
   if (hasParseProblem(result)) {
     lines.push("调试状态：");
@@ -476,9 +465,9 @@ function formatFailure(errorText, result, index, outputTemplate) {
   const lines = [];
 
   if (result) {
-    lines.push(renderOutputTemplate(outputTemplate, result, index + 1));
+    lines.push(renderOutputTemplate(outputTemplate, result));
   } else {
-    lines.push(`- ${index + 1}`);
+    lines.push("- ");
   }
 
   lines.push("调试状态：");
@@ -491,15 +480,15 @@ function formatFailure(errorText, result, index, outputTemplate) {
   return lines.join("\n");
 }
 
-function renderOutputTemplate(template, result, code) {
+function renderOutputTemplate(template, result) {
   return normalizeOutputTemplate(template).replace(/\[([^\]]+)\]/g, (_whole, token) =>
-    resolvePlaceholder(token.trim(), result, code)
+    resolvePlaceholder(token.trim(), result)
   );
 }
 
-function resolvePlaceholder(token, result, code) {
+function resolvePlaceholder(token, result) {
   if (token === "code") {
-    return String(code);
+    return result?.projectCode || "";
   }
 
   let match = /^t(\d+)$/i.exec(token);
@@ -534,7 +523,7 @@ function hasParseProblem(result) {
     return true;
   }
 
-  return result.sections.some((section) => !section?.ok);
+  return !result.projectCode || result.sections.some((section) => !section?.ok);
 }
 
 function formatSectionProblemLines(result) {
@@ -547,7 +536,8 @@ function formatSectionProblemLines(result) {
     .map((section) => {
       const title = section.title || section.key || "未知板块";
       return `- ${title}：${section.error || "未完整解析"}`;
-    });
+    })
+    .concat(result.projectCode ? [] : ["- 项目code：未匹配到 sonic_T????-.*"]);
 }
 
 function formatDebugLines(debug) {
@@ -647,10 +637,6 @@ function tabsRemove(tabId) {
 
 function windowsUpdate(windowId, value) {
   return callbackPromise((callback) => chrome.windows.update(windowId, value, callback));
-}
-
-function windowsCreate(value) {
-  return callbackPromise((callback) => chrome.windows.create(value, callback));
 }
 
 function sendTabMessage(tabId, message) {

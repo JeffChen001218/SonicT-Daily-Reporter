@@ -89,6 +89,13 @@
 
     throwIfStopped();
 
+    const projectCodeMatch = findProjectCode();
+    if (projectCodeMatch.code) {
+      log(`项目code命中 ${projectCodeMatch.fullMatch}`);
+    } else {
+      log("项目code未命中，已按 sonic_T????-.* 全局查询");
+    }
+
     const models = collectTableModels();
     log(`发现表格候选 ${models.length} 个`);
 
@@ -113,6 +120,8 @@
       result: {
         url: location.href,
         title: document.title,
+        projectCode: projectCodeMatch.code,
+        projectCodeMatch: projectCodeMatch.fullMatch,
         targetDateText: primaryTarget?.dateText || "",
         targetDateLabel: primaryTarget?.label || "",
         rowTargets,
@@ -190,6 +199,32 @@
       800
     );
     log("页面中已发现目标日期和配置板块文字");
+  }
+
+  function findProjectCode() {
+    const pattern = /sonic_T([^\s"'<>-]{4})-[^\s"'<>]*/;
+    const sources = [
+      location.href,
+      document.title,
+      document.body?.innerText || "",
+      document.documentElement?.textContent || "",
+      document.documentElement?.outerHTML || ""
+    ];
+
+    for (const source of sources) {
+      const match = pattern.exec(source);
+      if (match) {
+        return {
+          code: match[1],
+          fullMatch: match[0].slice(0, 160)
+        };
+      }
+    }
+
+    return {
+      code: "",
+      fullMatch: ""
+    };
   }
 
   function parseSection(section, models, context) {

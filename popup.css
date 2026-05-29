@@ -21,9 +21,8 @@
 }
 
 body {
-  width: 100vw;
-  min-width: 560px;
-  min-height: 100vh;
+  width: 560px;
+  min-height: 720px;
   margin: 0;
   overflow: hidden;
   background: var(--bg);
@@ -63,8 +62,7 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  height: 100vh;
-  min-height: 650px;
+  height: 720px;
   overflow: auto;
   padding: 14px;
 }

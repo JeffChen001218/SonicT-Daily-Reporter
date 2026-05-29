@@ -1,9 +1,5 @@
-const DEFAULT_REPORTS = [
-  {
-    id: "sample-ntba",
-    url: "https://ntba.gte666.com/#/dashboard/11500_132528"
-  }
-];
+const DEFAULT_REPORTS = [];
+const LEGACY_DEFAULT_REPORT_URL = "https://ntba.gte666.com/#/dashboard/11500_132528";
 
 const DEFAULT_CREDENTIALS = {
   account: "chenjianfeng",
@@ -32,6 +28,7 @@ const passwordInput = document.querySelector("#passwordInput");
 const startBtn = document.querySelector("#startBtn");
 const stopBtn = document.querySelector("#stopBtn");
 const addReportBtn = document.querySelector("#addReportBtn");
+const importOpenTbaBtn = document.querySelector("#importOpenTbaBtn");
 const addSectionBtn = document.querySelector("#addSectionBtn");
 const templateArea = document.querySelector("#templateArea");
 const outputArea = document.querySelector("#outputArea");
@@ -89,6 +86,8 @@ function bindEvents() {
     renderReports();
     scheduleSave();
   });
+
+  importOpenTbaBtn.addEventListener("click", importOpenTbaTabs);
 
   addSectionBtn.addEventListener("click", () => {
     parseSections.push({
@@ -284,12 +283,84 @@ function renderParseSections() {
   });
 }
 
+async function importOpenTbaTabs() {
+  const tabs = await chrome.tabs.query({});
+  const existingUrls = new Set(reports.map((report) => normalizeUrlForCompare(report.url)).filter(Boolean));
+  const tbaTabs = tabs
+    .filter((tab) => isTbaUrl(tab.url))
+    .sort((a, b) => {
+      if (a.windowId !== b.windowId) {
+        return a.windowId - b.windowId;
+      }
+      return a.index - b.index;
+    });
+
+  let imported = 0;
+  let skipped = 0;
+
+  tbaTabs.forEach((tab) => {
+    const normalizedUrl = normalizeUrlForCompare(tab.url);
+    if (!normalizedUrl || existingUrls.has(normalizedUrl)) {
+      skipped += 1;
+      return;
+    }
+
+    existingUrls.add(normalizedUrl);
+    reports.push({
+      id: createId(),
+      url: tab.url
+    });
+    imported += 1;
+  });
+
+  renderReports();
+  await saveConfig();
+  runState.textContent = `已导入 ${imported} 个，跳过 ${skipped} 个`;
+}
+
 function normalizeReports(value) {
-  const source = Array.isArray(value) && value.length ? value : DEFAULT_REPORTS;
+  if (isLegacyDefaultReports(value)) {
+    return [];
+  }
+
+  const source = Array.isArray(value) ? value : DEFAULT_REPORTS;
   return source.map((report) => ({
     id: report.id || createId(),
     url: report.url || ""
   }));
+}
+
+function isLegacyDefaultReports(value) {
+  return (
+    Array.isArray(value) &&
+    value.length === 1 &&
+    normalizeUrlForCompare(value[0]?.url) === normalizeUrlForCompare(LEGACY_DEFAULT_REPORT_URL)
+  );
+}
+
+function isTbaUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.hostname === "ntba.gte666.com";
+  } catch (error) {
+    return false;
+  }
+}
+
+function normalizeUrlForCompare(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const url = new URL(trimmed);
+    url.protocol = url.protocol.toLowerCase();
+    url.hostname = url.hostname.toLowerCase();
+    return url.href;
+  } catch (error) {
+    return trimmed;
+  }
 }
 
 function normalizeParseSections(value) {

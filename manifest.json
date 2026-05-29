@@ -10,7 +10,8 @@
     "type": "module"
   },
   "action": {
-    "default_title": "日报导出"
+    "default_title": "日报导出",
+    "default_popup": "popup.html"
   },
   "content_scripts": [
     {
