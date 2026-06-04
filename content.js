@@ -12,9 +12,20 @@
   const TEMPLATE_FIELD_STALE_RETRY_MS = 60000;
   const DATE_HEADER_PATTERN = /^(日期|时间|date|day)$/i;
   const DATE_CELL_PATTERN = /^\d{4}-\d{2}-\d{2}(?:\([^)]*\))?$/;
-  const VXE_TABLE_WRAPPER_SELECTOR = "[class*='vxe-table--main-wrapper']";
+  const VXE_TABLE_WRAPPER_SELECTOR = "[class*='vxe-table--main-wrapper'],[class*='vxe-table--render-wrapper'],[class*='vxe-table--fixed-left-wrapper'],[class*='vxe-table--fixed-right-wrapper']";
   const PANEL_STATUS_OVERLAY_ID = "__sonic_daily_panel_status_overlay__";
   const PANEL_STATUS_LOG_LIMIT = 12;
+  const TABLE_SCROLL_RENDER_DELAY_MS = 120;
+  const TABLE_SCROLL_STEP_RATIO = 0.72;
+  const TABLE_SCROLL_MAX_X_STEPS = 28;
+  const TABLE_SCROLL_MAX_Y_STEPS = 36;
+  const TABLE_COLUMN_MERGE_TOLERANCE_PX = 14;
+  const TABLE_ROW_MERGE_TOLERANCE_PX = 6;
+  const TABLE_ROW_VIEWPORT_MERGE_TOLERANCE_PX = 8;
+  const SECTION_LAZY_SCROLL_WAIT_MS = 700;
+  const SECTION_LAZY_SCROLL_ATTEMPTS = 4;
+  const SECTION_DISCOVERY_SCROLL_WAIT_MS = 650;
+  const SECTION_DISCOVERY_SCROLL_MAX_STEPS = 18;
 
   let cancelRequested = false;
   let panelStatusOverlayRows = [];
@@ -63,12 +74,19 @@
       rowOffsets.map((offset) => {
         const date = getDateByOffset(offset);
         const dateText = formatDate(date);
+        const weekdayLabel = WEEKDAYS[date.getDay()];
         return [
           String(offset),
           {
             offset,
             dateText,
-            label: `${dateText}(${WEEKDAYS[date.getDay()]})`
+            weekdayLabel,
+            label: `${dateText}(${weekdayLabel})`,
+            candidates: [
+              `${dateText}(${weekdayLabel})`,
+              `${dateText}（${weekdayLabel}）`,
+              dateText
+            ]
           }
         ];
       })
@@ -206,17 +224,18 @@
 
   async function waitForCompleteParse(options) {
     const startedAt = Date.now();
-    let lastResult = parseAllSections({
-      ...options,
-      silent: true
-    });
+    let lastResult = {
+      models: [],
+      sections: [],
+      diagnostics: []
+    };
     let lastSummary = "";
     let tableMissingSince = 0;
     let templatePendingSince = 0;
 
     while (Date.now() - startedAt < options.timeoutMs) {
       throwIfStopped();
-      lastResult = parseAllSections({
+      lastResult = await parseAllSections({
         ...options,
         silent: true
       });
@@ -297,13 +316,22 @@
     };
   }
 
-  function parseAllSections({ parseSections, rowTargets, rowOffsets, templateRequirements, log, silent }) {
-    const sectionContexts = buildSectionContexts(parseSections);
+  async function parseAllSections({ parseSections, rowTargets, rowOffsets, templateRequirements, log, silent }) {
+    const sectionContexts = await buildSectionContexts(parseSections);
     const parseLog = silent ? () => {} : log;
     let nextModelIndex = 0;
-    const sectionModelGroups = sectionContexts.map((sectionContext) =>
-      collectSectionTableModels(sectionContext, () => nextModelIndex++)
-    );
+    const sectionModelGroups = [];
+
+    for (const sectionContext of sectionContexts) {
+      await activateSectionLazyLoad(sectionContext);
+      const models = await collectSectionTableModels(sectionContext, () => nextModelIndex++, {
+        targetGroups: Object.values(rowTargets || {})
+          .map((target) => target.candidates || [target.label, target.dateText].filter(Boolean))
+          .filter((group) => group.length)
+      });
+      sectionModelGroups.push(models);
+    }
+
     const models = sectionModelGroups.flat();
 
     const sections = parseSections.map((section, index) =>
@@ -727,29 +755,14 @@
       .join("；");
   }
 
-  function buildSectionContexts(parseSections) {
-    const contexts = parseSections.map((section) => {
-      const titleNode = chooseSectionTitleNode(section.title);
-      if (!titleNode) {
-        return {
-          title: section.title,
-          titleNode: null,
-          scope: null,
-          band: null
-        };
-      }
+  async function buildSectionContexts(parseSections) {
+    const scrollRoot = findDashboardScrollRoot();
+    const contexts = [];
 
-      const rect = titleNode.getBoundingClientRect();
-      return {
-        title: section.title,
-        titleNode,
-        scope: findPanelDataScope(titleNode),
-        band: {
-          top: rect.top - 16,
-          bottom: Infinity
-        }
-      };
-    });
+    for (const section of parseSections) {
+      const titleNode = await discoverSectionTitleNode(section.title, scrollRoot);
+      contexts.push(createSectionContext(section.title, titleNode));
+    }
 
     const titleTops = contexts
       .map((context) => context.band?.top)
@@ -766,6 +779,63 @@
     });
 
     return contexts;
+  }
+
+  function createSectionContext(title, titleNode) {
+    if (!titleNode) {
+      return {
+        title,
+        titleNode: null,
+        scope: null,
+        band: null
+      };
+    }
+
+    const rect = titleNode.getBoundingClientRect();
+    return {
+      title,
+      titleNode,
+      scope: findPanelDataScope(titleNode),
+      band: {
+        top: rect.top - 16,
+        bottom: Infinity
+      }
+    };
+  }
+
+  async function discoverSectionTitleNode(title, scrollRoot) {
+    let titleNode = chooseSectionTitleNode(title);
+    if (titleNode) {
+      return titleNode;
+    }
+
+    const maxScrollTop = getMaxScrollTop(scrollRoot);
+    const viewport = getScrollViewportHeight(scrollRoot);
+    const step = Math.max(320, Math.floor(viewport * 0.72));
+    const currentTop = getScrollTop(scrollRoot);
+    const downwardPositions = Array.from(
+      { length: SECTION_DISCOVERY_SCROLL_MAX_STEPS },
+      (_item, index) => Math.min(maxScrollTop, currentTop + step * (index + 1))
+    );
+    const positions = uniqueNumbersInOrder([
+      currentTop,
+      ...downwardPositions,
+      maxScrollTop,
+      0
+    ]);
+
+    for (const top of positions) {
+      throwIfStopped();
+      setScrollTop(scrollRoot, top);
+      dispatchSyntheticScrollEvents(scrollRoot);
+      await sleep(SECTION_DISCOVERY_SCROLL_WAIT_MS);
+      titleNode = chooseSectionTitleNode(title);
+      if (titleNode) {
+        return titleNode;
+      }
+    }
+
+    return null;
   }
 
   function chooseSectionTitleNode(title) {
@@ -800,6 +870,122 @@
       node = node.parentElement;
     }
     return node || null;
+  }
+
+  function findDashboardScrollRoot() {
+    const candidates = Array.from(document.querySelectorAll("main,section,[class*='dashboard'],[class*='canvas'],[class*='content'],[class*='scroll'],[class*='layout']"))
+      .filter((node) => isScrollableOnAxis(node, "y"))
+      .sort((a, b) => {
+        const scoreDiff = scoreDashboardScrollRoot(b) - scoreDashboardScrollRoot(a);
+        if (scoreDiff !== 0) {
+          return scoreDiff;
+        }
+        return getScrollOverflow(b, "y") - getScrollOverflow(a, "y");
+      });
+
+    return candidates[0] || document.scrollingElement || document.documentElement;
+  }
+
+  function scoreDashboardScrollRoot(node) {
+    const rect = node.getBoundingClientRect();
+    const className = String(node.className || "");
+    let score = 0;
+    if (/dashboard|canvas|content|main|scroll|layout/i.test(className)) {
+      score += 20;
+    }
+    if (rect.width > window.innerWidth * 0.45) {
+      score += 10;
+    }
+    if (rect.height > window.innerHeight * 0.35) {
+      score += 10;
+    }
+    if (node.querySelector?.("[class*='vxe-table'],h3")) {
+      score += 20;
+    }
+    return score;
+  }
+
+  function getScrollTop(node) {
+    if (!node || node === document.scrollingElement || node === document.documentElement || node === document.body) {
+      return window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
+    }
+    return Number.isFinite(node.scrollTop) ? node.scrollTop : 0;
+  }
+
+  function setScrollTop(node, top) {
+    if (!node || node === document.scrollingElement || node === document.documentElement || node === document.body) {
+      window.scrollTo(window.scrollX, top);
+      return;
+    }
+    node.scrollTop = top;
+  }
+
+  function dispatchSyntheticScrollEvents(node) {
+    const event = new Event("scroll", {
+      bubbles: true
+    });
+    if (node && node !== document.scrollingElement && node !== document.documentElement && node !== document.body) {
+      node.dispatchEvent(event);
+    }
+    window.dispatchEvent(new Event("scroll"));
+    window.dispatchEvent(new Event("resize"));
+  }
+
+  function getMaxScrollTop(node) {
+    if (!node || node === document.scrollingElement || node === document.documentElement || node === document.body) {
+      const scrollHeight = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+      return Math.max(0, scrollHeight - window.innerHeight);
+    }
+    return Math.max(0, node.scrollHeight - node.clientHeight);
+  }
+
+  function getScrollViewportHeight(node) {
+    if (!node || node === document.scrollingElement || node === document.documentElement || node === document.body) {
+      return window.innerHeight || document.documentElement.clientHeight || 700;
+    }
+    return node.clientHeight || node.getBoundingClientRect?.().height || 700;
+  }
+
+  async function activateSectionLazyLoad(sectionContext) {
+    if (!sectionContext?.titleNode) {
+      return;
+    }
+
+    for (let attempt = 0; attempt < SECTION_LAZY_SCROLL_ATTEMPTS; attempt += 1) {
+      throwIfStopped();
+      scrollSectionIntoView(sectionContext);
+      await sleep(SECTION_LAZY_SCROLL_WAIT_MS);
+
+      if (hasSectionTableWrapper(sectionContext) || findSectionNodes(".n-progress", sectionContext).length) {
+        return;
+      }
+    }
+  }
+
+  function scrollSectionIntoView(sectionContext) {
+    const target = sectionContext.scope || sectionContext.titleNode;
+    target.scrollIntoView({
+      block: "center",
+      inline: "nearest"
+    });
+
+    const scrollParent = findScrollableParent(target);
+    if (scrollParent && scrollParent !== document.scrollingElement) {
+      const rect = target.getBoundingClientRect();
+      const parentRect = scrollParent.getBoundingClientRect();
+      scrollParent.scrollTop += rect.top - parentRect.top - Math.max(40, parentRect.height * 0.18);
+    }
+  }
+
+  function findScrollableParent(node) {
+    let current = node?.parentElement;
+    while (current && current !== document.body && current !== document.documentElement) {
+      if (isScrollableOnAxis(current, "y")) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
   }
 
   function inspectSectionPanelState(sectionContext) {
@@ -864,11 +1050,25 @@
       .filter((node) => getButtonText(node).replace(/\s+/g, "") === "刷新");
   }
 
-  function collectSectionTableModels(sectionContext, nextIndex) {
-    return findSectionTableWrappers(sectionContext)
+  async function collectSectionTableModels(sectionContext, nextIndex, options = {}) {
+    const models = [];
+    const roots = uniqueNodes(
+      findSectionTableWrappers(sectionContext)
+        .map(getTableModelRoot)
+        .filter(Boolean)
+    )
       .filter(isVisible)
-      .map((root) => buildTableModel(root, nextIndex(), sectionContext))
-      .filter((model) => model.rows.length);
+      .filter((root) => !root.closest(`#${PANEL_STATUS_OVERLAY_ID}`));
+
+    for (const root of roots) {
+      throwIfStopped();
+      const model = await buildTableModel(root, nextIndex(), sectionContext, options);
+      if (model.rows.length) {
+        models.push(model);
+      }
+    }
+
+    return models;
   }
 
   function findSectionTableWrappers(sectionContext) {
@@ -877,6 +1077,12 @@
     }
 
     return Array.from(sectionContext.scope.querySelectorAll(VXE_TABLE_WRAPPER_SELECTOR));
+  }
+
+  function getTableModelRoot(node) {
+    return node?.closest?.(".vxe-table") ||
+      node?.closest?.("[class*='vxe-table']") ||
+      node;
   }
 
   function findSectionNodes(selector, sectionContext) {
@@ -988,7 +1194,7 @@
     }
 
     const rows = Object.values(section?.rows || {});
-    if (rows.some((row) => DATE_CELL_PATTERN.test(cleanText(row?.cells?.[0])))) {
+    if (rows.some((row) => extractDateText(row?.cells?.[0]))) {
       return 1;
     }
 
@@ -1048,7 +1254,7 @@
 
       for (const offset of context.rowOffsets) {
         const target = context.rowTargets[String(offset)];
-        const row = findTargetRow(model, target.label, target.dateText);
+        const row = findTargetRow(model, target);
         if (row) {
           rows[String(offset)] = {
             offset,
@@ -1094,7 +1300,8 @@
         sourceWrapperTop: bestMatch.model.sourceWrapperTop,
         headers: bestMatch.model.headers,
         rows: bestMatch.rows,
-        validation: bestMatch.validation
+        validation: bestMatch.validation,
+        scanStats: bestMatch.model.scanStats
       });
 
       const status = bestMatch.validation.ok
@@ -1122,8 +1329,9 @@
     const fallback = candidates.slice(0, 3).map((model) => ({
       tableIndex: model.index,
       headers: model.headers,
+      scanStats: model.scanStats,
       rowCount: model.rows.length,
-      sampleRows: model.rows.slice(0, 3).map((row) => row.cells)
+      sampleRows: model.rows.slice(0, 8).map((row) => row.cells)
     }));
 
     context.log(`${debugPrefix} 未找到目标日期行`, fallback);
@@ -1172,13 +1380,12 @@
     );
   }
 
-  function buildTableModel(root, index, sectionContext) {
+  async function buildTableModel(root, index, sectionContext, options = {}) {
     const rect = root.getBoundingClientRect();
-    const headerRows = collectHeaderRows(root);
-    const bodyRows = collectBodyRows(root, headerRows);
-    const headerInfos = buildHeaderInfos(headerRows);
-    const headers = normalizeHeaders(buildHeaders(headerRows), headerInfos);
-    const rows = buildBodyRowModels(bodyRows, headers, headerInfos);
+    const scanData = await collectTableScanData(root, options);
+    const headerInfos = scanData.headerInfos;
+    const headers = normalizeHeaders(buildHeadersFromHeaderInfos(headerInfos), headerInfos);
+    const rows = buildBodyRowModels(scanData.rowGroups, headers, headerInfos);
 
     return {
       index,
@@ -1187,17 +1394,300 @@
       sourceWrapperTop: Number.isFinite(rect.top) ? Math.round(rect.top) : null,
       headers,
       headerInfos,
-      rows
+      rows,
+      scanStats: scanData.stats
     };
   }
 
-  function buildBodyRowModels(bodyRows, headers, headerInfos) {
+  async function collectTableScanData(root, options = {}) {
+    const targetGroups = normalizeTargetTextGroups(options.targetGroups || options.targetTexts);
+    const scrollState = createTableScrollState(root);
+    const originalScrolls = snapshotScrollerPositions(scrollState.scrollers);
+    const originalWindowScroll = {
+      left: window.scrollX,
+      top: window.scrollY
+    };
+    const accumulator = createTableScanAccumulator();
+    const xPositions = getScrollPositions(scrollState.horizontalScroller, "x", TABLE_SCROLL_MAX_X_STEPS);
+    const yPositions = getScrollPositions(scrollState.verticalScroller, "y", TABLE_SCROLL_MAX_Y_STEPS);
+    const targetYPositions = [];
+
+    try {
+      root.scrollIntoView({
+        block: "center",
+        inline: "nearest"
+      });
+      await sleep(TABLE_SCROLL_RENDER_DELAY_MS);
+
+      for (const x of xPositions) {
+        throwIfStopped();
+        await setTableScrollPosition(scrollState, x, getScrollerTop(scrollState.verticalScroller));
+        collectVisibleTableSnapshot(root, scrollState, accumulator);
+      }
+
+      for (const y of yPositions) {
+        throwIfStopped();
+        await setTableScrollPosition(scrollState, 0, y);
+        const snapshot = collectVisibleTableSnapshot(root, scrollState, accumulator);
+        if (targetGroups.length && snapshot.rows.some((row) => row.text && targetGroups.some((group) => group.some((text) => row.text.includes(text))))) {
+          targetYPositions.push(y);
+        }
+        if (targetGroups.length && hasFoundAllTargetGroups(accumulator, targetGroups)) {
+          break;
+        }
+      }
+
+      const rowsToExpand = targetYPositions.length ? targetYPositions : [getScrollerTop(scrollState.verticalScroller)];
+      for (const y of uniqueNumbers(rowsToExpand)) {
+        for (const x of xPositions) {
+          throwIfStopped();
+          await setTableScrollPosition(scrollState, x, y);
+          collectVisibleTableSnapshot(root, scrollState, accumulator);
+        }
+      }
+    } finally {
+      restoreScrollerPositions(originalScrolls);
+      window.scrollTo(originalWindowScroll.left, originalWindowScroll.top);
+      await sleep(TABLE_SCROLL_RENDER_DELAY_MS);
+    }
+
+    return {
+      headerInfos: Array.from(accumulator.headerMap.values()).sort(compareCellInfos),
+      rowGroups: Array.from(accumulator.rowMap.values()),
+      stats: {
+        xPositions: xPositions.length,
+        yPositions: yPositions.length,
+        targetYPositions: targetYPositions.length,
+        horizontalScrollable: isScrollableOnAxis(scrollState.horizontalScroller, "x"),
+        verticalScrollable: isScrollableOnAxis(scrollState.verticalScroller, "y")
+      }
+    };
+  }
+
+  function createTableScrollState(root) {
+    const scrollers = findTableScrollers(root);
+    const horizontalScroller = chooseBestScroller(scrollers, "x") || root;
+    const verticalScroller = chooseBestScroller(scrollers, "y") || horizontalScroller || root;
+
+    return {
+      root,
+      scrollers,
+      horizontalScroller,
+      verticalScroller,
+      snapshotId: 0
+    };
+  }
+
+  function findTableScrollers(root) {
+    const preferredSelectors = [
+      ".vxe-table--body-wrapper",
+      ".vxe-table--header-wrapper",
+      ".vxe-table--footer-wrapper",
+      ".vxe-table--scroll-x-wrapper",
+      ".vxe-table--scroll-y-wrapper",
+      ".body--wrapper",
+      ".header--wrapper",
+      ".el-table__body-wrapper",
+      ".ant-table-body",
+      ".arco-table-body",
+      ".semi-table-body"
+    ].join(",");
+
+    const preferred = Array.from(root.querySelectorAll(preferredSelectors));
+    const scrollable = Array.from(root.querySelectorAll("*")).filter(
+      (node) => isScrollableOnAxis(node, "x") || isScrollableOnAxis(node, "y")
+    );
+
+    return uniqueNodes([root, ...preferred, ...scrollable]).filter((node) => node instanceof Element);
+  }
+
+  function chooseBestScroller(scrollers, axis) {
+    const candidates = scrollers
+      .map((node) => ({
+        node,
+        overflow: getScrollOverflow(node, axis),
+        score: scoreScrollerCandidate(node, axis)
+      }))
+      .filter((item) => item.overflow > 1)
+      .sort((a, b) => {
+        if (b.score !== a.score) {
+          return b.score - a.score;
+        }
+        return b.overflow - a.overflow;
+      });
+
+    return candidates[0]?.node || null;
+  }
+
+  function scoreScrollerCandidate(node, axis) {
+    const className = String(node.className || "");
+    let score = 0;
+    if (/vxe-table--body-wrapper|body--wrapper|ant-table-body|el-table__body-wrapper|arco-table-body|semi-table-body/.test(className)) {
+      score += 80;
+    }
+    if (axis === "x" && /header-wrapper|scroll-x/.test(className)) {
+      score += 20;
+    }
+    if (axis === "y" && /scroll-y/.test(className)) {
+      score += 20;
+    }
+    if (node.querySelector?.("tbody tr,.vxe-table--body tr,[role='row']")) {
+      score += 20;
+    }
+    return score;
+  }
+
+  function snapshotScrollerPositions(scrollers) {
+    return uniqueNodes(scrollers).map((node) => ({
+      node,
+      left: node.scrollLeft,
+      top: node.scrollTop
+    }));
+  }
+
+  function restoreScrollerPositions(scrolls) {
+    scrolls.forEach((item) => {
+      item.node.scrollLeft = item.left;
+      item.node.scrollTop = item.top;
+    });
+  }
+
+  function getScrollPositions(scroller, axis, maxSteps) {
+    if (!scroller) {
+      return [0];
+    }
+
+    const axisMax = axis === "x"
+      ? Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+      : Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (axisMax <= 1) {
+      return [0];
+    }
+
+    const viewport = axis === "x" ? scroller.clientWidth : scroller.clientHeight;
+    const step = Math.max(80, Math.floor((viewport || axisMax) * TABLE_SCROLL_STEP_RATIO));
+    const positions = [0];
+
+    for (let value = step; value < axisMax && positions.length < maxSteps - 1; value += step) {
+      positions.push(value);
+    }
+    positions.push(axisMax);
+
+    return uniqueNumbers(positions.map((value) => Math.round(Math.max(0, Math.min(axisMax, value)))));
+  }
+
+  async function setTableScrollPosition(scrollState, left, top) {
+    const targets = new Map();
+    addScrollerTarget(targets, scrollState.horizontalScroller, left, null);
+    addScrollerTarget(targets, scrollState.verticalScroller, null, top);
+
+    scrollState.scrollers.forEach((scroller) => {
+      if (isScrollableOnAxis(scroller, "x")) {
+        addScrollerTarget(targets, scroller, left, null);
+      }
+      if (isScrollableOnAxis(scroller, "y")) {
+        addScrollerTarget(targets, scroller, null, top);
+      }
+    });
+
+    targets.forEach((target, scroller) => setScrollerPosition(scroller, target.left, target.top));
+    await sleep(TABLE_SCROLL_RENDER_DELAY_MS);
+  }
+
+  function addScrollerTarget(targets, scroller, left, top) {
+    if (!scroller) {
+      return;
+    }
+    const target = targets.get(scroller) || {
+      left: null,
+      top: null
+    };
+    if (Number.isFinite(left)) {
+      target.left = left;
+    }
+    if (Number.isFinite(top)) {
+      target.top = top;
+    }
+    targets.set(scroller, target);
+  }
+
+  function setScrollerPosition(scroller, left, top) {
+    if (!scroller) {
+      return;
+    }
+    if (Number.isFinite(left) && isScrollableOnAxis(scroller, "x")) {
+      scroller.scrollLeft = left;
+    }
+    if (Number.isFinite(top) && isScrollableOnAxis(scroller, "y")) {
+      scroller.scrollTop = top;
+    }
+  }
+
+  function getScrollerTop(scroller) {
+    return Number.isFinite(scroller?.scrollTop) ? scroller.scrollTop : 0;
+  }
+
+  function isScrollableOnAxis(node, axis) {
+    if (!node) {
+      return false;
+    }
+    return getScrollOverflow(node, axis) > 1;
+  }
+
+  function getScrollOverflow(node, axis) {
+    if (!node) {
+      return 0;
+    }
+    return axis === "x"
+      ? Math.max(0, node.scrollWidth - node.clientWidth)
+      : Math.max(0, node.scrollHeight - node.clientHeight);
+  }
+
+  function createTableScanAccumulator() {
+    return {
+      headerMap: new Map(),
+      rowMap: new Map()
+    };
+  }
+
+  function collectVisibleTableSnapshot(root, scrollState, accumulator) {
+    scrollState.snapshotId += 1;
+    const headerRows = collectHeaderRows(root);
+    const headerInfos = buildHeaderInfos(headerRows, scrollState);
+    const bodyRows = collectBodyRows(root, headerRows);
+    const rowGroups = collectBodyRowGroups(bodyRows, scrollState);
+
+    headerInfos.forEach((cell) => mergeCellInfoMap(accumulator.headerMap, cell, headerInfoKey(cell)));
+    rowGroups.forEach((group) => {
+      const key = group.rowKey;
+      let current = accumulator.rowMap.get(key);
+      if (!current) {
+        current = {
+          ...group,
+          parts: []
+        };
+        accumulator.rowMap.set(key, current);
+      }
+      current.parts.push(...group.parts);
+      current.text = [current.text, group.text].filter(Boolean).join(" | ");
+    });
+
+    return {
+      headers: headerInfos,
+      rows: rowGroups.map((group) => ({
+        ...group,
+        text: group.parts.flatMap((part) => part.cells).map((cell) => cell.text).filter(Boolean).join(" | ")
+      }))
+    };
+  }
+
+  function collectBodyRowGroups(bodyRows, scrollState) {
     const rowGroups = [];
 
     bodyRows.forEach((rowNode) => {
       const cellInfos = collectCells(rowNode)
         .filter((cell) => !isHeaderCell(cell))
-        .map(cellToInfo)
+        .map((cell) => cellToInfo(cell, scrollState))
         .filter((cell) => cell.text);
 
       if (!cellInfos.length) {
@@ -1205,11 +1695,17 @@
       }
 
       const rect = rowNode.getBoundingClientRect();
-      let group = rowGroups.find((item) => Math.abs(item.top - rect.top) <= 3);
+      const top = getAbsoluteTop(rowNode, scrollState);
+      const rowKey = getRowKey(rowNode, scrollState);
+      let group = rowGroups.find((item) => item.rowKey === rowKey || Math.abs(item.top - top) <= TABLE_ROW_MERGE_TOLERANCE_PX);
       if (!group) {
         group = {
-          top: rect.top,
-          parts: []
+          rowKey,
+          top,
+          viewportTop: rect.top,
+          snapshotId: scrollState?.snapshotId || 0,
+          parts: [],
+          text: ""
         };
         rowGroups.push(group);
       }
@@ -1217,17 +1713,106 @@
         node: rowNode,
         cells: cellInfos
       });
+      group.text = [group.text, ...cellInfos.map((cell) => cell.text)].filter(Boolean).join(" | ");
     });
 
+    return rowGroups;
+  }
+
+  function normalizeTargetTextGroups(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    if (value.every((item) => typeof item === "string")) {
+      return value.map((item) => [item].filter(Boolean));
+    }
+
+    return value
+      .map((item) => (Array.isArray(item) ? item : [item]))
+      .map((group) => group.map((text) => cleanText(text)).filter(Boolean))
+      .filter((group) => group.length);
+  }
+
+  function hasFoundAllTargetGroups(accumulator, targetGroups) {
+    if (!targetGroups.length) {
+      return false;
+    }
+
+    const rowTexts = Array.from(accumulator.rowMap.values()).map((row) => row.text || "");
+    return targetGroups.every((group) => rowTexts.some((rowText) => group.some((targetText) => rowText.includes(targetText))));
+  }
+
+  function mergeCellInfoMap(map, cell, key) {
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, cell);
+      return;
+    }
+
+    if (cell.text.length > existing.text.length) {
+      map.set(key, {
+        ...existing,
+        ...cell
+      });
+    }
+  }
+
+  function headerInfoKey(cell) {
+    if (cell.columnKey) {
+      return `col:${cell.columnKey}:${Math.round(cell.absoluteTop / TABLE_ROW_MERGE_TOLERANCE_PX)}:${cell.text}`;
+    }
+    return `${Math.round(cell.absoluteLeft / TABLE_COLUMN_MERGE_TOLERANCE_PX)}:${Math.round(cell.absoluteTop / TABLE_ROW_MERGE_TOLERANCE_PX)}:${cell.text}`;
+  }
+
+  function getRowKey(rowNode, scrollState) {
+    const rowId = [
+      rowNode.getAttribute("rowid"),
+      rowNode.getAttribute("data-rowid"),
+      rowNode.getAttribute("data-row-id"),
+      rowNode.dataset?.rowid,
+      rowNode.dataset?.rowId,
+      rowNode.getAttribute("aria-rowindex")
+    ]
+      .map((value) => cleanText(value))
+      .find(Boolean);
+
+    if (rowId) {
+      return `id:${rowId}`;
+    }
+
+    return `top:${Math.round(getAbsoluteTop(rowNode, scrollState) / TABLE_ROW_MERGE_TOLERANCE_PX)}`;
+  }
+
+  function getAbsoluteLeft(node, scrollState) {
+    const rect = node.getBoundingClientRect();
+    const scroller = scrollState?.horizontalScroller;
+    const scrollerRect = scroller?.getBoundingClientRect?.();
+    if (scroller && scrollerRect && Number.isFinite(scroller.scrollLeft)) {
+      return rect.left - scrollerRect.left + scroller.scrollLeft;
+    }
+    return rect.left + window.scrollX;
+  }
+
+  function getAbsoluteTop(node, scrollState) {
+    const rect = node.getBoundingClientRect();
+    const scroller = scrollState?.verticalScroller;
+    const scrollerRect = scroller?.getBoundingClientRect?.();
+    if (scroller && scrollerRect && Number.isFinite(scroller.scrollTop)) {
+      return rect.top - scrollerRect.top + scroller.scrollTop;
+    }
+    return rect.top + window.scrollY;
+  }
+
+  function buildBodyRowModels(rowGroups, headers, headerInfos) {
     const rows = [];
     const seen = new Set();
+    const mergedRowGroups = mergeViewportSiblingRowGroups(rowGroups);
 
-    rowGroups
+    mergedRowGroups
       .sort((a, b) => a.top - b.top)
       .forEach((group, rowIndex) => {
-        const cellInfos = dedupeCellInfos(group.parts.flatMap((part) => part.cells)).sort(
-          (a, b) => a.left - b.left
-        );
+        const cellInfos = dedupeCellInfos(group.parts.flatMap((part) => part.cells)).sort(compareCellInfos);
         const cells = alignCellsToHeaders(cellInfos, headers, headerInfos);
         const rowText = cells.join(" | ");
         if (seen.has(rowText)) {
@@ -1247,15 +1832,134 @@
     return rows;
   }
 
+  function mergeViewportSiblingRowGroups(rowGroups) {
+    const groups = [];
+
+    rowGroups
+      .slice()
+      .sort((a, b) => {
+        const viewportDiff = (a.viewportTop ?? a.top ?? 0) - (b.viewportTop ?? b.top ?? 0);
+        if (Math.abs(viewportDiff) > TABLE_ROW_VIEWPORT_MERGE_TOLERANCE_PX) {
+          return viewportDiff;
+        }
+        return (a.top || 0) - (b.top || 0);
+      })
+      .forEach((rowGroup) => {
+        const viewportTop = rowGroup.viewportTop ?? rowGroup.top;
+        let target = groups.find(
+          (group) =>
+            group.snapshotId === rowGroup.snapshotId &&
+            Math.abs((group.viewportTop ?? group.top ?? 0) - viewportTop) <= TABLE_ROW_VIEWPORT_MERGE_TOLERANCE_PX
+        );
+
+        if (!target) {
+          target = {
+            ...rowGroup,
+            parts: [],
+            text: ""
+          };
+          groups.push(target);
+        }
+
+        target.top = Math.min(target.top ?? rowGroup.top, rowGroup.top);
+        target.viewportTop = Math.min(target.viewportTop ?? viewportTop, viewportTop);
+        target.parts.push(...rowGroup.parts);
+        target.text = [target.text, rowGroup.text].filter(Boolean).join(" | ");
+      });
+
+    return groups;
+  }
+
+  function buildHeadersFromHeaderInfos(headerInfos) {
+    if (!Array.isArray(headerInfos) || !headerInfos.length) {
+      return [];
+    }
+
+    const groups = groupHeaderInfosByRow(headerInfos);
+    const grid = [];
+
+    groups.forEach((cells, rowIndex) => {
+      grid[rowIndex] ||= [];
+      let columnIndex = 0;
+      cells.forEach((cell) => {
+        while (grid[rowIndex][columnIndex]) {
+          columnIndex += 1;
+        }
+
+        const colSpan = Math.max(1, Number(cell.colSpan || 1));
+        const rowSpan = Math.max(1, Number(cell.rowSpan || 1));
+        for (let r = 0; r < rowSpan; r += 1) {
+          for (let c = 0; c < colSpan; c += 1) {
+            grid[rowIndex + r] ||= [];
+            grid[rowIndex + r][columnIndex + c] = cell.text;
+          }
+        }
+        columnIndex += colSpan;
+      });
+    });
+
+    const maxColumns = grid.reduce((max, row) => Math.max(max, row.length), 0);
+    const headers = [];
+
+    for (let columnIndex = 0; columnIndex < maxColumns; columnIndex += 1) {
+      const parts = [];
+      grid.forEach((row) => {
+        const part = row[columnIndex];
+        if (part && parts[parts.length - 1] !== part) {
+          parts.push(part);
+        }
+      });
+      headers[columnIndex] = parts.join("/");
+    }
+
+    return headers;
+  }
+
+  function groupHeaderInfosByRow(headerInfos) {
+    const groups = [];
+
+    headerInfos
+      .slice()
+      .sort(compareCellInfos)
+      .forEach((cell) => {
+        let group = groups.find((item) => Math.abs(item.top - cell.absoluteTop) <= TABLE_ROW_MERGE_TOLERANCE_PX);
+        if (!group) {
+          group = {
+            top: cell.absoluteTop,
+            cells: []
+          };
+          groups.push(group);
+        }
+        group.cells.push(cell);
+      });
+
+    return groups
+      .sort((a, b) => a.top - b.top)
+      .map((group) => dedupeHeaderInfos(group.cells).sort(compareCellInfos));
+  }
+
   function alignCellsToHeaders(cellInfos, headers, headerInfos) {
     const rawCells = cellInfos.map((cell) => cell.text);
     const headerColumns = getHeaderColumns(headers, headerInfos);
-    if (!headerColumns.length || rawCells.length <= headerColumns.length) {
+    if (!headerColumns.length || !rawCells.length) {
       return rawCells;
     }
 
     const usedIndexes = new Set();
     const aligned = headerColumns.map((header) => {
+      if (header.columnKey) {
+        const keyedMatch = cellInfos
+          .map((cell, index) => ({
+            cell,
+            index
+          }))
+          .find((candidate) => !usedIndexes.has(candidate.index) && candidate.cell.columnKey === header.columnKey);
+        if (keyedMatch) {
+          usedIndexes.add(keyedMatch.index);
+          return keyedMatch.cell.text;
+        }
+      }
+
       const candidates = cellInfos
         .map((cell, index) => ({
           cell,
@@ -1265,7 +1969,7 @@
         .filter((candidate) => !usedIndexes.has(candidate.index))
         .sort((a, b) => a.distance - b.distance);
 
-      const tolerance = Math.max(40, header.width * 0.9);
+      const tolerance = Math.max(40, header.width * 0.55);
       const nearCandidates = candidates.filter((candidate) => candidate.distance <= tolerance);
       const best = nearCandidates[0];
 
@@ -1286,18 +1990,19 @@
       return [];
     }
 
-    const uniqueHeaderInfos = dedupeHeaderInfos(headerInfos).sort((a, b) => a.left - b.left);
-    if (uniqueHeaderInfos.length < headers.filter(Boolean).length) {
+    const headerColumns = buildHeaderColumnInfos(headerInfos);
+    if (headerColumns.length < headers.filter(Boolean).length) {
       return [];
     }
 
     return headers.map((header, index) => {
-      const headerInfo = uniqueHeaderInfos[index];
+      const headerInfo = headerColumns[index];
       return {
         text: header || headerInfo?.text || "",
-        left: headerInfo?.left ?? 0,
+        columnKey: headerInfo?.columnKey || "",
+        left: headerInfo?.absoluteLeft ?? headerInfo?.left ?? 0,
         width: headerInfo?.width || 80,
-        centerX: headerInfo?.centerX ?? 0
+        centerX: headerInfo?.absoluteCenterX ?? headerInfo?.centerX ?? 0
       };
     });
   }
@@ -1357,79 +2062,73 @@
     });
   }
 
-  function buildHeaders(headerRows) {
-    if (!headerRows.length) {
-      return [];
-    }
+  function buildHeaderInfos(headerRows, scrollState) {
+    return dedupeCellInfos(
+      headerRows
+        .flatMap((row) => collectCells(row).map((cell) => headerCellToInfo(cell, scrollState)))
+        .filter((cell) => cell.text || cell.width > 0)
+    ).sort(compareCellInfos);
+  }
 
-    const headerRowModels = buildHeaderRowModels(headerRows);
+  function buildHeaderColumnInfos(headerInfos) {
+    const rows = groupHeaderInfosByRow(headerInfos);
     const grid = [];
-    headerRowModels.forEach((cells, rowIndex) => {
+
+    rows.forEach((cells, rowIndex) => {
       grid[rowIndex] ||= [];
       let columnIndex = 0;
+
       cells.forEach((cell) => {
         while (grid[rowIndex][columnIndex]) {
           columnIndex += 1;
         }
 
-        for (let r = 0; r < cell.rowSpan; r += 1) {
-          for (let c = 0; c < cell.colSpan; c += 1) {
+        const colSpan = Math.max(1, Number(cell.colSpan || 1));
+        const rowSpan = Math.max(1, Number(cell.rowSpan || 1));
+        for (let r = 0; r < rowSpan; r += 1) {
+          for (let c = 0; c < colSpan; c += 1) {
             grid[rowIndex + r] ||= [];
-            grid[rowIndex + r][columnIndex + c] = cell.text;
+            grid[rowIndex + r][columnIndex + c] = getSpannedHeaderInfo(cell, c, colSpan);
           }
         }
-        columnIndex += cell.colSpan;
+        columnIndex += colSpan;
       });
     });
 
     const maxColumns = grid.reduce((max, row) => Math.max(max, row.length), 0);
-    const headers = [];
+    const columns = [];
 
     for (let columnIndex = 0; columnIndex < maxColumns; columnIndex += 1) {
-      const parts = [];
-      grid.forEach((row) => {
-        const part = row[columnIndex];
-        if (part && parts[parts.length - 1] !== part) {
-          parts.push(part);
+      for (let rowIndex = grid.length - 1; rowIndex >= 0; rowIndex -= 1) {
+        const cell = grid[rowIndex]?.[columnIndex];
+        if (cell) {
+          columns[columnIndex] = cell;
+          break;
         }
-      });
-      headers[columnIndex] = parts.join("/");
+      }
     }
 
-    return headers;
+    return columns.filter(Boolean);
   }
 
-  function buildHeaderRowModels(headerRows) {
-    const groups = [];
+  function getSpannedHeaderInfo(cell, spanIndex, colSpan) {
+    if (colSpan <= 1) {
+      return cell;
+    }
 
-    headerRows.forEach((row) => {
-      const rect = row.getBoundingClientRect();
-      let group = groups.find((item) => Math.abs(item.top - rect.top) <= 3);
-      if (!group) {
-        group = {
-          top: rect.top,
-          cells: []
-        };
-        groups.push(group);
-      }
+    const width = (cell.width || 80) / colSpan;
+    const left = (cell.left || 0) + width * spanIndex;
+    const absoluteLeft = (cell.absoluteLeft || cell.left || 0) + width * spanIndex;
 
-      group.cells.push(...collectCells(row).map(headerCellToInfo).filter((cell) => cell.text));
-    });
-
-    return groups
-      .sort((a, b) => a.top - b.top)
-      .map((group) => dedupeHeaderInfos(group.cells).sort((a, b) => a.left - b.left));
-  }
-
-  function buildHeaderInfos(headerRows) {
-    return dedupeCellInfos(
-      headerRows.flatMap((row) => collectCells(row).map(cellToInfo).filter((cell) => cell.text))
-    ).sort((a, b) => {
-      if (Math.abs(a.top - b.top) > 3) {
-        return a.top - b.top;
-      }
-      return a.left - b.left;
-    });
+    return {
+      ...cell,
+      columnKey: cell.columnKey ? `${cell.columnKey}:${spanIndex}` : "",
+      left,
+      absoluteLeft,
+      width,
+      centerX: absoluteLeft + width / 2,
+      absoluteCenterX: absoluteLeft + width / 2
+    };
   }
 
   function normalizeHeaders(headers, headerInfos) {
@@ -1468,9 +2167,23 @@
     return precise.length ? precise : candidates;
   }
 
-  function findTargetRow(model, targetDateLabel, targetDateText) {
-    return model.rows.find((row) => row.text.includes(targetDateLabel)) ||
-      model.rows.find((row) => row.text.includes(targetDateText));
+  function findTargetRow(model, target) {
+    const candidates = normalizeTargetTextGroups([target?.candidates || [target?.label, target?.dateText]])[0] || [];
+    const targetDateText = cleanText(target?.dateText);
+
+    return (
+      model.rows.find((row) => {
+        const firstDate = extractDateText(row.cells?.[0]);
+        return firstDate && firstDate === targetDateText;
+      }) ||
+      model.rows.find((row) => candidates.some((candidate) => row.text.includes(candidate))) ||
+      null
+    );
+  }
+
+  function extractDateText(value) {
+    const match = /(\d{4}-\d{2}-\d{2})/.exec(cleanText(value));
+    return match?.[1] || "";
   }
 
   function findVisibleInput(type) {
@@ -1560,29 +2273,73 @@
     return cell.tagName?.toLowerCase() === "th" || cell.getAttribute?.("role") === "columnheader";
   }
 
-  function cellToInfo(cell) {
+  function cellToInfo(cell, scrollState) {
     const rect = cell.getBoundingClientRect();
+    const absoluteLeft = getAbsoluteLeft(cell, scrollState);
+    const absoluteTop = getAbsoluteTop(cell, scrollState);
     return {
       text: cleanText(getVisibleText(cell)),
-      left: rect.left,
-      top: rect.top,
+      columnKey: getCellColumnKey(cell),
+      left: absoluteLeft,
+      top: absoluteTop,
+      viewportLeft: rect.left,
+      viewportTop: rect.top,
+      absoluteLeft,
+      absoluteTop,
       width: rect.width,
-      centerX: rect.left + rect.width / 2
+      centerX: absoluteLeft + rect.width / 2,
+      absoluteCenterX: absoluteLeft + rect.width / 2
     };
   }
 
-  function headerCellToInfo(cell) {
+  function headerCellToInfo(cell, scrollState) {
     return {
-      ...cellToInfo(cell),
+      ...cellToInfo(cell, scrollState),
       colSpan: Number(cell.getAttribute("colspan") || cell.colSpan || 1),
       rowSpan: Number(cell.getAttribute("rowspan") || cell.rowSpan || 1)
     };
   }
 
+  function getCellColumnKey(cell) {
+    const direct = [
+      cell.getAttribute("colid"),
+      cell.getAttribute("data-colid"),
+      cell.getAttribute("data-column-id"),
+      cell.getAttribute("data-col-id"),
+      cell.getAttribute("aria-colindex"),
+      cell.dataset?.colid,
+      cell.dataset?.columnId,
+      cell.dataset?.colId
+    ]
+      .map((value) => cleanText(value))
+      .find(Boolean);
+
+    if (direct) {
+      return direct;
+    }
+
+    const classes = String(cell.className || "").split(/\s+/).filter(Boolean);
+    const colClass = classes.find((name) => /^col_[A-Za-z0-9_$-]+$/.test(name));
+    if (colClass) {
+      return colClass;
+    }
+
+    return "";
+  }
+
+  function compareCellInfos(a, b) {
+    if (Math.abs((a.top || 0) - (b.top || 0)) > TABLE_ROW_MERGE_TOLERANCE_PX) {
+      return (a.top || 0) - (b.top || 0);
+    }
+    return (a.left || 0) - (b.left || 0);
+  }
+
   function dedupeCellInfos(cells) {
     const seen = new Set();
     return cells.filter((cell) => {
-      const key = `${Math.round(cell.left)}:${Math.round(cell.top)}:${cell.text}`;
+      const key = cell.columnKey
+        ? `col:${cell.columnKey}:${Math.round(cell.top / TABLE_ROW_MERGE_TOLERANCE_PX)}:${cell.text}`
+        : `${Math.round(cell.left / TABLE_COLUMN_MERGE_TOLERANCE_PX)}:${Math.round(cell.top / TABLE_ROW_MERGE_TOLERANCE_PX)}:${cell.text}`;
       if (seen.has(key)) {
         return false;
       }
@@ -1594,7 +2351,9 @@
   function dedupeHeaderInfos(cells) {
     const seen = new Set();
     return cells.filter((cell) => {
-      const key = `${Math.round(cell.left)}:${cell.text}`;
+      const key = cell.columnKey
+        ? `col:${cell.columnKey}:${Math.round(cell.top / TABLE_ROW_MERGE_TOLERANCE_PX)}:${cell.text}`
+        : `${Math.round(cell.left / TABLE_COLUMN_MERGE_TOLERANCE_PX)}:${Math.round(cell.top / TABLE_ROW_MERGE_TOLERANCE_PX)}:${cell.text}`;
       if (seen.has(key)) {
         return false;
       }
@@ -1633,6 +2392,26 @@
 
   function uniqueNodes(nodes) {
     return Array.from(new Set(nodes));
+  }
+
+  function uniqueNumbers(values) {
+    return Array.from(new Set(values.filter((value) => Number.isFinite(value)))).sort((a, b) => a - b);
+  }
+
+  function uniqueNumbersInOrder(values) {
+    const seen = new Set();
+    const result = [];
+    values
+      .filter((value) => Number.isFinite(value))
+      .forEach((value) => {
+        const normalized = Math.round(value);
+        if (seen.has(normalized)) {
+          return;
+        }
+        seen.add(normalized);
+        result.push(normalized);
+      });
+    return result;
   }
 
   function normalizeParseSections(value) {
