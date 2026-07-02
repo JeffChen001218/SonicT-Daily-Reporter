@@ -105,7 +105,7 @@
 
     resetPanelStatusOverlay(parseSections);
     log(`开始页面嗅探，解析板块 ${parseSections.map((section) => section.title).join("、") || "未配置"}`);
-    log(`目标行 ${Object.values(rowTargets).map((target) => `r${target.offset}:${target.label}`).join("、")}`);
+    log(`目标行 ${Object.values(rowTargets).map((target) => `${formatRowOffset(target.offset)}:${target.label}`).join("、")}`);
     await waitForDomReady();
     renderPanelStatusOverlay();
 
@@ -322,35 +322,53 @@
     let nextModelIndex = 0;
     const sectionModelGroups = [];
 
-    for (const sectionContext of sectionContexts) {
+    for (let index = 0; index < sectionContexts.length; index += 1) {
+      const sectionContext = sectionContexts[index];
+      const sectionRequirements = getSectionTemplateRequirements(templateRequirements, index);
+      const required = isTemplateSectionRequired(templateRequirements, index);
+      const sectionRowOffsets = getSectionRowOffsets(rowOffsets, sectionRequirements, required, templateRequirements);
+
+      if (!required) {
+        sectionModelGroups.push([]);
+        continue;
+      }
+
       await activateSectionLazyLoad(sectionContext);
       const models = await collectSectionTableModels(sectionContext, () => nextModelIndex++, {
-        targetGroups: Object.values(rowTargets || {})
-          .map((target) => target.candidates || [target.label, target.dateText].filter(Boolean))
-          .filter((group) => group.length)
+        targetGroups: getTargetGroupsForRowOffsets(rowTargets, sectionRowOffsets)
       });
       sectionModelGroups.push(models);
     }
 
     const models = sectionModelGroups.flat();
 
-    const sections = parseSections.map((section, index) =>
-      parseSection(
+    const sections = parseSections.map((section, index) => {
+      const sectionRequirements = getSectionTemplateRequirements(templateRequirements, index);
+      const required = isTemplateSectionRequired(templateRequirements, index);
+      const sectionInfo = {
+        ...section,
+        key: `t${index + 1}`,
+        index: index + 1
+      };
+
+      if (!required) {
+        return createSkippedSectionResult(sectionInfo);
+      }
+
+      return parseSection(
         {
-          ...section,
-          key: `t${index + 1}`,
-          index: index + 1
+          ...sectionInfo
         },
         sectionModelGroups[index],
         {
           sectionContext: sectionContexts[index],
-          sectionRequirements: getSectionTemplateRequirements(templateRequirements, index),
+          sectionRequirements,
           rowTargets,
-          rowOffsets,
+          rowOffsets: getSectionRowOffsets(rowOffsets, sectionRequirements, required, templateRequirements),
           log: parseLog
         }
-      )
-    );
+      );
+    });
     const diagnostics = sections.map((section, index) =>
       buildPanelStatusDiagnostics(section, sectionContexts[index], sectionModelGroups[index])
     );
@@ -1094,9 +1112,12 @@
   }
 
   function normalizeTemplateRequirements(value) {
+    const cells = normalizeTemplateRequirementList(value?.cells, true);
+    const headers = normalizeTemplateRequirementList(value?.headers, false);
     return {
-      cells: normalizeTemplateRequirementList(value?.cells, true),
-      headers: normalizeTemplateRequirementList(value?.headers, false)
+      cells,
+      headers,
+      sectionIndexes: normalizeTemplateSectionIndexes(value?.sectionIndexes, cells, headers)
     };
   }
 
@@ -1121,11 +1142,75 @@
       );
   }
 
+  function normalizeTemplateSectionIndexes(value, cells, headers) {
+    const indexes = Array.isArray(value)
+      ? value
+      : [
+          ...(cells || []).map((item) => item.sectionIndex),
+          ...(headers || []).map((item) => item.sectionIndex)
+        ];
+
+    return Array.from(
+      new Set(
+        indexes
+          .map((index) => Number(index))
+          .filter((index) => Number.isInteger(index) && index >= 0)
+      )
+    );
+  }
+
   function getSectionTemplateRequirements(templateRequirements, sectionIndex) {
     return {
       cells: (templateRequirements?.cells || []).filter((item) => item.sectionIndex === sectionIndex),
       headers: (templateRequirements?.headers || []).filter((item) => item.sectionIndex === sectionIndex)
     };
+  }
+
+  function isTemplateSectionRequired(templateRequirements, sectionIndex) {
+    const sectionIndexes = Array.isArray(templateRequirements?.sectionIndexes)
+      ? templateRequirements.sectionIndexes
+      : [];
+    return !sectionIndexes.length || sectionIndexes.includes(sectionIndex);
+  }
+
+  function getSectionRowOffsets(fallbackRowOffsets, requirements, required, templateRequirements) {
+    if (!required) {
+      return [];
+    }
+
+    const offsets = Array.from(
+      new Set(
+        (requirements?.cells || [])
+          .map((item) => Number(item.rowOffset))
+          .filter((offset) => Number.isInteger(offset))
+      )
+    ).sort((a, b) => a - b);
+
+    if (offsets.length) {
+      return offsets;
+    }
+
+    if ((requirements?.headers || []).length) {
+      return [];
+    }
+
+    if (hasTemplateSectionReferences(templateRequirements)) {
+      return [];
+    }
+
+    return normalizeRowOffsets(fallbackRowOffsets);
+  }
+
+  function hasTemplateSectionReferences(templateRequirements) {
+    return Array.isArray(templateRequirements?.sectionIndexes) && templateRequirements.sectionIndexes.length > 0;
+  }
+
+  function getTargetGroupsForRowOffsets(rowTargets, rowOffsets) {
+    return rowOffsets
+      .map((offset) => rowTargets?.[String(offset)])
+      .filter(Boolean)
+      .map((target) => target.candidates || [target.label, target.dateText].filter(Boolean))
+      .filter((group) => group.length);
   }
 
   function validateSectionRows({ headers, rows, rowOffsets, requirements }) {
@@ -1138,13 +1223,13 @@
     rowOffsets.forEach((offset) => {
       const row = rows[String(offset)];
       if (!row) {
-        problems.push(`缺少 r${offset}`);
+        problems.push(`缺少 ${formatRowOffset(offset)}`);
         return;
       }
 
       const dataCells = getTemplateCells(sectionLike, String(offset));
       if (!dataCells.length) {
-        problems.push(`r${offset} 行无数据`);
+        problems.push(`${formatRowOffset(offset)} 行无数据`);
       }
     });
 
@@ -1158,7 +1243,7 @@
     (requirements?.cells || []).forEach((requirement) => {
       const value = getTemplateCells(sectionLike, String(requirement.rowOffset))[requirement.columnIndex];
       if (!isValidDataCell(value)) {
-        problems.push(`r${requirement.rowOffset},c${requirement.columnIndex + 1} 无效`);
+        problems.push(`${formatRowOffset(requirement.rowOffset)},c${requirement.columnIndex + 1} 无效`);
       }
     });
 
@@ -1230,6 +1315,7 @@
   function parseSection(section, models, context) {
     const sectionContext = context.sectionContext || {};
     const candidates = Array.isArray(models) ? models : [];
+    const sectionRowOffsets = Array.isArray(context.rowOffsets) ? context.rowOffsets : [];
     const debugPrefix = `[${section.title}]`;
     context.log(`${debugPrefix} 候选表格 ${candidates.length} 个`);
     const panelState = inspectSectionPanelState(sectionContext);
@@ -1252,7 +1338,7 @@
       const rows = {};
       const missingOffsets = [];
 
-      for (const offset of context.rowOffsets) {
+      for (const offset of sectionRowOffsets) {
         const target = context.rowTargets[String(offset)];
         const row = findTargetRow(model, target);
         if (row) {
@@ -1270,7 +1356,7 @@
         }
       }
 
-      if (!Object.keys(rows).length) {
+      if (sectionRowOffsets.length && !Object.keys(rows).length) {
         continue;
       }
 
@@ -1278,7 +1364,7 @@
         section,
         headers: model.headers,
         rows,
-        rowOffsets: context.rowOffsets,
+        rowOffsets: sectionRowOffsets,
         requirements: context.sectionRequirements
       });
 
@@ -1342,8 +1428,25 @@
       tableIndex: -1,
       headers: [],
       rows: {},
-      error: `未找到配置目标行：${context.rowOffsets.map((offset) => `r${offset}`).join("、")}`
+      error: sectionRowOffsets.length
+        ? `未找到配置目标行：${formatRowOffsets(sectionRowOffsets)}`
+        : "未找到可解析表格"
     });
+  }
+
+  function createSkippedSectionResult(section) {
+    return {
+      ok: true,
+      key: section.key,
+      index: section.index,
+      title: section.title,
+      status: "skipped",
+      panelLoaded: false,
+      tableIndex: -1,
+      headers: [],
+      rows: {},
+      error: ""
+    };
   }
 
   function createSectionResult({ section, status, panelLoaded, tableIndex, headers, rows, error }) {
@@ -2438,6 +2541,14 @@
     );
 
     return normalized.length ? normalized : DEFAULT_ROW_OFFSETS;
+  }
+
+  function formatRowOffsets(offsets) {
+    return offsets.map(formatRowOffset).join("、");
+  }
+
+  function formatRowOffset(offset) {
+    return Number(offset) === 0 ? "r" : `r${offset}`;
   }
 
   function getDateByOffset(offset) {

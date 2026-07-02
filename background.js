@@ -383,11 +383,11 @@ function normalizeOutputTemplate(value) {
 
 function collectRowOffsetsFromTemplate(template) {
   const offsets = new Set();
-  const pattern = /\[t\d+,r([+-]?\d+),c\d+\]/gi;
+  const pattern = /\[t\d+,r([+-]?\d+)?,c\d+\]/gi;
   let match = pattern.exec(template);
 
   while (match) {
-    offsets.add(Number(match[1]));
+    offsets.add(parseRowOffsetToken(match[1]));
     match = pattern.exec(template);
   }
 
@@ -401,18 +401,29 @@ function collectRowOffsetsFromTemplate(template) {
 function collectTemplateRequirements(template) {
   const cells = [];
   const headers = [];
+  const sectionIndexes = [];
   const seenCells = new Set();
   const seenHeaders = new Set();
+  const seenSections = new Set();
   const pattern = /\[([^\]]+)\]/g;
   let match = pattern.exec(template);
 
   while (match) {
     const token = match[1].trim();
-    let tokenMatch = /^t(\d+),r([+-]?\d+),c(\d+)$/i.exec(token);
+    const sectionMatch = /^t(\d+)(?:$|,)/i.exec(token);
+    if (sectionMatch) {
+      const sectionIndex = Number(sectionMatch[1]) - 1;
+      if (sectionIndex >= 0 && !seenSections.has(sectionIndex)) {
+        seenSections.add(sectionIndex);
+        sectionIndexes.push(sectionIndex);
+      }
+    }
+
+    let tokenMatch = /^t(\d+),r([+-]?\d+)?,c(\d+)$/i.exec(token);
     if (tokenMatch) {
       const item = {
         sectionIndex: Number(tokenMatch[1]) - 1,
-        rowOffset: Number(tokenMatch[2]),
+        rowOffset: parseRowOffsetToken(tokenMatch[2]),
         columnIndex: Number(tokenMatch[3]) - 1
       };
       const key = `${item.sectionIndex}:${item.rowOffset}:${item.columnIndex}`;
@@ -442,7 +453,8 @@ function collectTemplateRequirements(template) {
 
   return {
     cells,
-    headers
+    headers,
+    sectionIndexes
   };
 }
 
@@ -521,10 +533,10 @@ function resolvePlaceholder(token, result) {
     return valueOrEmpty(getTemplateHeaders(section)[headerIndex]);
   }
 
-  match = /^t(\d+),r([+-]?\d+),c(\d+)$/i.exec(token);
+  match = /^t(\d+),r([+-]?\d+)?,c(\d+)$/i.exec(token);
   if (match) {
     const section = getSection(result, Number(match[1]));
-    const rowOffset = String(Number(match[2]));
+    const rowOffset = String(parseRowOffsetToken(match[2]));
     const columnIndex = Number(match[3]) - 1;
     return valueOrEmpty(getTemplateCells(section, rowOffset)[columnIndex]);
   }
@@ -534,6 +546,10 @@ function resolvePlaceholder(token, result) {
 
 function getSection(result, sectionNumber) {
   return result?.sections?.[sectionNumber - 1] || null;
+}
+
+function parseRowOffsetToken(value) {
+  return value === undefined || value === "" ? 0 : Number(value);
 }
 
 function valueOrEmpty(value) {
