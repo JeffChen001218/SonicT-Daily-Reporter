@@ -26,6 +26,10 @@
   const SECTION_LAZY_SCROLL_ATTEMPTS = 4;
   const SECTION_DISCOVERY_SCROLL_WAIT_MS = 650;
   const SECTION_DISCOVERY_SCROLL_MAX_STEPS = 18;
+  const DATA_TABLE_VIEW_LABEL = "数据表";
+  const VIEW_MODE_LABELS = ["趋势图", "堆积图", "累计图", "分布图", "饼状图", DATA_TABLE_VIEW_LABEL];
+  const DATA_TABLE_VIEW_SWITCH_WAIT_MS = 450;
+  const DATA_TABLE_VIEW_TABLE_WAIT_MS = 2500;
 
   let cancelRequested = false;
   let panelStatusOverlayRows = [];
@@ -334,6 +338,7 @@
       }
 
       await activateSectionLazyLoad(sectionContext);
+      await ensureSectionDataTableView(sectionContext, parseLog);
       const models = await collectSectionTableModels(sectionContext, () => nextModelIndex++, {
         targetGroups: getTargetGroupsForRowOffsets(rowTargets, sectionRowOffsets)
       });
@@ -980,6 +985,171 @@
     }
   }
 
+  async function ensureSectionDataTableView(sectionContext, log) {
+    if (!sectionContext?.scope || hasSectionTableWrapper(sectionContext) || hasSectionRefreshButton(sectionContext)) {
+      return;
+    }
+
+    const progressNodes = findSectionNodes(".n-progress", sectionContext);
+    if (progressNodes.length) {
+      return;
+    }
+
+    const scopedModes = findVisibleViewModeSpans(sectionContext.scope);
+    if (!scopedModes.length) {
+      return;
+    }
+
+    const scopedDataTable = scopedModes.find((item) => item.text === DATA_TABLE_VIEW_LABEL);
+    if (scopedDataTable && (scopedModes.length > 1 || isLikelyViewModeOption(scopedDataTable.node))) {
+      log?.(`[${sectionContext.title}] 切换视图到数据表`);
+      await clickViewModeNode(scopedDataTable.node);
+      await waitForSectionTableWrapper(sectionContext, DATA_TABLE_VIEW_TABLE_WAIT_MS);
+      return;
+    }
+
+    const currentMode = scopedModes.find((item) => item.text !== DATA_TABLE_VIEW_LABEL);
+    if (!currentMode) {
+      await waitForSectionTableWrapper(sectionContext, DATA_TABLE_VIEW_SWITCH_WAIT_MS);
+      return;
+    }
+
+    log?.(`[${sectionContext.title}] 当前视图 ${currentMode.text}，尝试切换到数据表`);
+    await clickViewModeNode(currentMode.node);
+    await sleep(DATA_TABLE_VIEW_SWITCH_WAIT_MS);
+
+    const dataTableOption = findVisibleDataTableOption(currentMode.node);
+    if (!dataTableOption) {
+      return;
+    }
+
+    await clickViewModeNode(dataTableOption);
+    await waitForSectionTableWrapper(sectionContext, DATA_TABLE_VIEW_TABLE_WAIT_MS);
+  }
+
+  function findVisibleViewModeSpans(root) {
+    if (!root) {
+      return [];
+    }
+
+    return Array.from(root.querySelectorAll("span"))
+      .filter((node) => !node.closest(`#${PANEL_STATUS_OVERLAY_ID}`))
+      .filter(isVisible)
+      .map((node) => ({
+        node,
+        text: cleanText(getVisibleText(node))
+      }))
+      .filter((item) => VIEW_MODE_LABELS.includes(item.text));
+  }
+
+  function findVisibleDataTableOption(triggerNode) {
+    const triggerRect = triggerNode?.getBoundingClientRect?.();
+    const candidates = Array.from(document.querySelectorAll("span"))
+      .filter((node) => !node.closest(`#${PANEL_STATUS_OVERLAY_ID}`))
+      .filter((node) => node !== triggerNode)
+      .filter(isVisible)
+      .filter((node) => cleanText(getVisibleText(node)) === DATA_TABLE_VIEW_LABEL)
+      .map((node) => ({
+        node,
+        score: scoreViewModeOption(node, triggerRect)
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    return candidates[0]?.node || null;
+  }
+
+  function scoreViewModeOption(node, triggerRect) {
+    const rect = node.getBoundingClientRect();
+    let score = isLikelyViewModeOption(node) ? 100 : 0;
+    if (triggerRect && Number.isFinite(triggerRect.left)) {
+      const dx = Math.abs((rect.left + rect.right) / 2 - (triggerRect.left + triggerRect.right) / 2);
+      const dy = Math.abs((rect.top + rect.bottom) / 2 - (triggerRect.top + triggerRect.bottom) / 2);
+      score -= dx * 0.02 + dy * 0.01;
+    }
+    return score;
+  }
+
+  function isLikelyViewModeOption(node) {
+    return Boolean(
+      node.closest(
+        [
+          "[role='option']",
+          "[role='menuitem']",
+          "[role='tab']",
+          ".ant-select-item-option",
+          ".ant-dropdown-menu-item",
+          ".el-select-dropdown__item",
+          ".el-dropdown-menu__item",
+          ".arco-select-option",
+          ".arco-dropdown-option",
+          ".semi-select-option",
+          ".semi-dropdown-item",
+          ".n-base-select-option",
+          ".n-dropdown-option",
+          ".ant-tabs-tab",
+          ".el-tabs__item"
+        ].join(",")
+      )
+    );
+  }
+
+  async function clickViewModeNode(node) {
+    const target = getViewModeClickTarget(node);
+    target.scrollIntoView({
+      block: "center",
+      inline: "nearest"
+    });
+    target.focus?.();
+    target.click();
+    await sleep(DATA_TABLE_VIEW_SWITCH_WAIT_MS);
+  }
+
+  function getViewModeClickTarget(node) {
+    return node.closest(
+      [
+        "button",
+        "[role='button']",
+        "[role='option']",
+        "[role='menuitem']",
+        "[role='tab']",
+        "[role='combobox']",
+        "[aria-haspopup='listbox']",
+        "[aria-haspopup='menu']",
+        ".ant-select-selector",
+        ".ant-select-item-option",
+        ".ant-dropdown-trigger",
+        ".ant-dropdown-menu-item",
+        ".el-select",
+        ".el-select-dropdown__item",
+        ".el-dropdown",
+        ".el-dropdown-menu__item",
+        ".arco-select-view",
+        ".arco-select-option",
+        ".arco-dropdown-option",
+        ".semi-select-selection",
+        ".semi-select-option",
+        ".semi-dropdown-item",
+        ".n-base-selection",
+        ".n-base-select-option",
+        ".n-dropdown-option",
+        ".ant-tabs-tab",
+        ".el-tabs__item"
+      ].join(",")
+    ) || node;
+  }
+
+  async function waitForSectionTableWrapper(sectionContext, timeoutMs) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      throwIfStopped();
+      if (hasSectionTableWrapper(sectionContext)) {
+        return true;
+      }
+      await sleep(150);
+    }
+    return hasSectionTableWrapper(sectionContext);
+  }
+
   function scrollSectionIntoView(sectionContext) {
     const target = sectionContext.scope || sectionContext.titleNode;
     target.scrollIntoView({
@@ -1038,7 +1208,7 @@
 
     return {
       status: "failed",
-      error: "面板加载结束但未展示 vxe-table--main-wrapper"
+      error: "面板加载结束但未展示数据表"
     };
   }
 
